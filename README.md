@@ -32,6 +32,7 @@ dictate-min --list-input-devices
 - `DICTATE_SAMPLE_RATE`: input sample rate hint (default `16000`, auto-falls back if unsupported)
 - `DICTATE_PASTE`: `1` or `0` (default `1` in `ptt`, `0` in `loopback`)
 - `DICTATE_PASTE_MODE`: `clipboard`, `type`, `primary` (default `type` on Linux, `clipboard` otherwise)
+  - invalid values fall back to `clipboard`
 - `DICTATE_PASTE_PRIMARY_CLICK`: for `primary` mode on Linux, trigger middle-click paste after setting PRIMARY selection (default `1`)
 - `DICTATE_PASTE_PRESERVE`: preserve and restore prior clipboard/selection text around paste in `clipboard`/`primary` modes (default `1`)
 - `DICTATE_PASTE_RESTORE_DELAY_MS`: delay before restoring clipboard after paste to avoid race with target app (default `80`)

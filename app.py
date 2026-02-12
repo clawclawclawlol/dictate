@@ -204,7 +204,7 @@ class Pipeline:
         self._context_text = ""
         self._prev_audio_tail: np.ndarray | None = None
         self._last_emitted_words: list[str] = []
-        if not self.cfg.ollama_model:
+        if self.cfg.cleanup and not self.cfg.ollama_model:
             self.cfg.ollama_model = self._default_ollama_model()
 
     def reset_context(self) -> None:
@@ -389,6 +389,8 @@ class Pipeline:
         if self._has_output:
             text = " " + text
         mode = self.cfg.paste_mode
+        target = self._active_window_desc()
+        self._debug_log(f"paste target={target} mode={mode}")
         if mode == "type":
             self._kb.type(text)
         elif mode == "primary":
@@ -404,6 +406,10 @@ class Pipeline:
                 pyperclip.copy(text)
                 self._paste_with_shortcut()
         self._has_output = True
+
+    def _debug_log(self, msg: str) -> None:
+        if self.cfg.debug:
+            print(f"[debug {time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
     def _paste_with_shortcut(self) -> None:
         time.sleep(0.04)
@@ -491,6 +497,23 @@ class Pipeline:
             except Exception:
                 continue
         return None
+
+    @staticmethod
+    def _active_window_desc() -> str:
+        if platform.system() != "Linux":
+            return "unknown"
+        if shutil.which("xdotool"):
+            try:
+                title = subprocess.check_output(
+                    ["xdotool", "getactivewindow", "getwindowname"],
+                    text=True,
+                    timeout=1,
+                ).strip()
+                if title:
+                    return title
+            except Exception:
+                pass
+        return "unknown"
 
     @staticmethod
     def _dedup(text: str) -> str:
