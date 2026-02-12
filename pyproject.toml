@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dictate-min"
+version = "0.0.1"
+description = "Minimal push-to-talk dictation for Linux/macOS"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24",
+  "sounddevice>=0.4.6",
+  "scipy>=1.10",
+  "pynput>=1.7.6",
+  "pyperclip>=1.8.2",
+  "requests>=2.31",
+  "faster-whisper>=1.0.3",
+]
+
+[project.scripts]
+dictate-min = "app:main"
