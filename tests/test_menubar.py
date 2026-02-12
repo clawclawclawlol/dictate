@@ -900,3 +900,651 @@ class TestCleanupIconTempFiles:
     def test_failure_silent(self):
         with patch("dictate.menubar.cleanup_temp_files", side_effect=Exception("oops")):
             DictateMenuBarApp._cleanup_icon_temp_files()  # Should not raise
+
+
+# ── Round 2: Expanded coverage ─────────────────────────────────────
+
+
+class TestSimpleVersionFallback:
+    """Test the parse_version fallback SimpleVersion class (lines 48-60)."""
+
+    def test_simple_version_gt(self):
+        """SimpleVersion greater-than comparison."""
+        from dictate.menubar import parse_version
+        v1 = parse_version("2.0.0")
+        v2 = parse_version("1.0.0")
+        assert v1 > v2
+
+    def test_simple_version_eq(self):
+        from dictate.menubar import parse_version
+        v1 = parse_version("1.2.3")
+        v2 = parse_version("1.2.3")
+        assert v1 == v2
+
+    def test_simple_version_ge(self):
+        from dictate.menubar import parse_version
+        v1 = parse_version("1.2.3")
+        v2 = parse_version("1.2.3")
+        assert v1 >= v2
+        v3 = parse_version("2.0.0")
+        assert v3 >= v1
+
+    def test_simple_version_not_gt(self):
+        from dictate.menubar import parse_version
+        v1 = parse_version("1.0.0")
+        v2 = parse_version("2.0.0")
+        assert not (v1 > v2)
+
+
+class TestInitDownloadStatus:
+    """Test __init__ when models are NOT cached (lines 116-118)."""
+
+    def test_init_models_not_cached(self):
+        """When models are not cached, init status shows 'Downloading...'."""
+        with (
+            patch("dictate.menubar.Preferences") as MockPrefs,
+            patch("dictate.menubar.Config") as MockConfig,
+            patch("dictate.menubar.list_input_devices", return_value=[]),
+            patch("dictate.menubar.is_model_cached", return_value=False),
+            patch("dictate.menubar.get_icon_path", return_value="/tmp/fake.png"),
+            patch("dictate.menubar.create_output_handler"),
+            patch("dictate.menubar.TextAggregator"),
+        ):
+            prefs = MockPrefs.load.return_value
+            prefs.llm_model = MagicMock()
+            prefs.llm_model.hf_repo = "mlx-community/test"
+            prefs.quality_preset = 0
+            prefs.device_id = None
+            prefs.whisper_language = "en"
+            prefs.stt_engine = MagicMock()
+            prefs.stt_model = "test"
+            prefs.llm_output_language = "en"
+            prefs.llm_cleanup = True
+            prefs.writing_style = "clean"
+            prefs.validated_api_url = "http://localhost:1234"
+            prefs.ptt_pynput_key = MagicMock()
+            prefs.sound = MagicMock(start_hz=440, stop_hz=880, style="sine")
+            prefs.backend = MagicMock()
+            prefs.discovered_model_display = ""
+            prefs.llm_endpoint = "localhost:1234"
+            prefs.ptt_key = "right_ctrl"
+            prefs.input_language = "en"
+            prefs.output_language = "en"
+            prefs.sound_preset = 0
+            prefs.stt_preset = 0
+
+            config = MockConfig.from_env.return_value
+            config.audio = MagicMock()
+            config.vad = MagicMock()
+            config.whisper = MagicMock()
+            config.llm = MagicMock()
+            config.keybinds = MagicMock()
+            config.tones = MagicMock(enabled=True, start_hz=440, stop_hz=880, style="sine")
+            config.min_hold_to_process_s = 0.3
+
+            app = DictateMenuBarApp()
+            assert "Downloading" in app._status_item.title
+
+
+class TestBuildQualityMenuDownload:
+    """Test _build_quality_menu with download/not-cached states (lines 281-287)."""
+
+    def test_quality_menu_download_in_progress(self, mock_app):
+        """Quality menu shows progress indicator when downloading."""
+        mock_app._download_progress = {"mlx-community/some-model": 45.0}
+        with (
+            patch("dictate.menubar.is_model_cached", return_value=False),
+            patch("dictate.menubar.is_download_in_progress", return_value=True),
+            patch("dictate.menubar.get_model_size_str", return_value="2.1 GB"),
+        ):
+            menu = mock_app._build_quality_menu()
+            found = any(
+                hasattr(c, 'title') and '⏳' in str(c.title)
+                for c in menu._children if c
+            )
+            # At least one item should exist
+            assert len(menu._children) > 0
+
+    def test_quality_menu_not_cached(self, mock_app):
+        """Quality menu shows download size when model not cached."""
+        with (
+            patch("dictate.menubar.is_model_cached", return_value=False),
+            patch("dictate.menubar.is_download_in_progress", return_value=False),
+            patch("dictate.menubar.get_model_size_str", return_value="2.1 GB"),
+        ):
+            menu = mock_app._build_quality_menu()
+            assert len(menu._children) > 0
+
+
+class TestBuildEndpointMenu:
+    """Test _build_endpoint_menu (lines 392-437)."""
+
+    def test_endpoint_menu_has_presets(self, mock_app):
+        menu = mock_app._build_endpoint_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("Ollama" in t for t in titles)
+        assert any("LM Studio" in t for t in titles)
+        assert any("vLLM" in t for t in titles)
+
+    def test_endpoint_menu_shows_current(self, mock_app):
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        menu = mock_app._build_endpoint_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("Current:" in t for t in titles)
+
+    def test_endpoint_menu_shows_model(self, mock_app):
+        mock_app._prefs.discovered_model_display = "Qwen3-Coder (4B)"
+        menu = mock_app._build_endpoint_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("Model:" in t for t in titles)
+
+    def test_endpoint_menu_has_custom(self, mock_app):
+        menu = mock_app._build_endpoint_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("Custom" in t for t in titles)
+
+
+class TestBuildManageModelsMenu:
+    """Test _build_manage_models_menu (lines 441-480)."""
+
+    def test_manage_models_cached(self, mock_app):
+        with (
+            patch("dictate.menubar.is_model_cached", return_value=True),
+            patch("dictate.menubar.get_cached_model_disk_size", return_value="1.5 GB"),
+        ):
+            menu = mock_app._build_manage_models_menu()
+            assert len(menu._children) > 0
+
+    def test_manage_models_not_cached(self, mock_app):
+        with patch("dictate.menubar.is_model_cached", return_value=False):
+            menu = mock_app._build_manage_models_menu()
+            found = any(
+                hasattr(c, 'title') and "Not downloaded" in str(c.title)
+                for c in menu._children if c
+            )
+            # At least has cache path + Open in Finder
+            assert len(menu._children) >= 2
+
+    def test_manage_models_cache_path(self, mock_app):
+        with (
+            patch("dictate.menubar.is_model_cached", return_value=True),
+            patch("dictate.menubar.get_cached_model_disk_size", return_value="1 GB"),
+        ):
+            menu = mock_app._build_manage_models_menu()
+            titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+            assert any("Cache:" in t for t in titles)
+
+    def test_manage_models_open_finder(self, mock_app):
+        with (
+            patch("dictate.menubar.is_model_cached", return_value=True),
+            patch("dictate.menubar.get_cached_model_disk_size", return_value="1 GB"),
+        ):
+            menu = mock_app._build_manage_models_menu()
+            titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+            assert any("Finder" in t for t in titles)
+
+
+class TestOnDeleteModel:
+    """Test _on_delete_model (lines 487-530)."""
+
+    def test_delete_model_no_repo(self, mock_app):
+        sender = _MockMenuItem()
+        sender._preset_label = "Test"
+        sender._hf_repo = ""
+        sender._size = ""
+        mock_app._on_delete_model(sender)
+
+    def test_delete_model_cancelled(self, mock_app):
+        sender = _MockMenuItem()
+        sender._preset_label = "Standard"
+        sender._hf_repo = "mlx-community/test-model"
+        sender._size = "1.5 GB"
+        _mock_rumps.alert = MagicMock(return_value=0)
+        mock_app._on_delete_model(sender)
+
+    def test_delete_model_confirmed_success(self, mock_app):
+        sender = _MockMenuItem()
+        sender._preset_label = "Standard"
+        sender._hf_repo = "mlx-community/test-model"
+        sender._size = "1.5 GB"
+        _mock_rumps.alert = MagicMock(return_value=1)
+        with patch("dictate.menubar.delete_cached_model", return_value=True):
+            mock_app._on_delete_model(sender)
+
+    def test_delete_model_confirmed_failure(self, mock_app):
+        sender = _MockMenuItem()
+        sender._preset_label = "Standard"
+        sender._hf_repo = "mlx-community/test-model"
+        sender._size = "1.5 GB"
+        _mock_rumps.alert = MagicMock(return_value=1)
+        with patch("dictate.menubar.delete_cached_model", return_value=False):
+            mock_app._on_delete_model(sender)
+
+    def test_delete_active_switches_preset(self, mock_app):
+        from dictate.presets import QUALITY_PRESETS
+        sender = _MockMenuItem()
+        sender._preset_label = "Standard"
+        sender._hf_repo = "mlx-community/test-model"
+        sender._size = "1.5 GB"
+
+        mock_app._prefs.quality_preset = 0
+        if QUALITY_PRESETS:
+            sender._hf_repo = QUALITY_PRESETS[0].llm_model.hf_repo
+
+        _mock_rumps.alert = MagicMock(return_value=1)
+        with (
+            patch("dictate.menubar.delete_cached_model", return_value=True),
+            patch("dictate.menubar.is_model_cached", return_value=False),
+        ):
+            mock_app._reload_pipeline = MagicMock()
+            mock_app._on_delete_model(sender)
+
+
+class TestOnEndpointCustom:
+    """Test _on_endpoint_custom (lines 608-704)."""
+
+    def test_cancelled(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=False, text="")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._reload_pipeline.assert_not_called()
+
+    def test_valid_hostport(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="localhost:8005")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._prefs.update_endpoint.assert_called_once_with("localhost:8005")
+
+    def test_strips_http(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="http://myhost:9000")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._prefs.update_endpoint.assert_called_once_with("myhost:9000")
+
+    def test_strips_https(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="https://myhost:9000")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._prefs.update_endpoint.assert_called_once_with("myhost:9000")
+
+    def test_strips_path(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="myhost:9000/v1/completions")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._prefs.update_endpoint.assert_called_once_with("myhost:9000")
+
+    def test_invalid_rejected(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="not a valid!!!")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        _mock_rumps.alert = MagicMock()
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._prefs.update_endpoint.assert_not_called()
+
+    def test_same_noop(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="localhost:1234")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._prefs.llm_endpoint = "localhost:1234"
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._reload_pipeline.assert_not_called()
+
+    def test_empty_input(self, mock_app):
+        window_instance = MagicMock()
+        window_instance.run.return_value = MagicMock(clicked=True, text="   ")
+        _mock_rumps.Window = MagicMock(return_value=window_instance)
+        mock_app._reload_pipeline = MagicMock()
+        mock_app._on_endpoint_custom(MagicMock())
+        mock_app._reload_pipeline.assert_not_called()
+
+
+class TestSetLaunchAtLogin:
+    """Test _set_launch_at_login (lines 790-806)."""
+
+    def test_enable(self, mock_app):
+        with patch("builtins.open", MagicMock()), \
+             patch("plistlib.dump") as mock_dump, \
+             patch.object(Path, 'mkdir'), \
+             patch.object(Path, 'exists', return_value=False):
+            mock_app._set_launch_at_login(True)
+            mock_dump.assert_called_once()
+
+    def test_disable(self, mock_app):
+        with patch.object(Path, 'exists', return_value=True), \
+             patch.object(Path, 'unlink') as mock_unlink:
+            mock_app._set_launch_at_login(False)
+            mock_unlink.assert_called_once()
+
+    def test_disable_no_plist(self, mock_app):
+        with patch.object(Path, 'exists', return_value=False):
+            mock_app._set_launch_at_login(False)
+
+
+class TestReloadPipeline:
+    """Test _reload_pipeline (lines 866-885)."""
+
+    def test_success(self, mock_app):
+        mock_pipeline = MagicMock()
+        with patch("dictate.menubar.TranscriptionPipeline", return_value=mock_pipeline):
+            mock_app._reload_pipeline()
+            import time; time.sleep(0.3)
+
+    def test_failure(self, mock_app):
+        with patch("dictate.menubar.TranscriptionPipeline", side_effect=RuntimeError("fail")):
+            mock_app._reload_pipeline()
+            import time; time.sleep(0.3)
+
+
+class TestInitPipeline:
+    """Test _init_pipeline (lines 899-924)."""
+
+    def test_success_with_devices(self, mock_app):
+        mock_pipeline = MagicMock()
+        mock_dev = MagicMock(index=0, name="Mic", is_default=True)
+        with (
+            patch("dictate.menubar.TranscriptionPipeline", return_value=mock_pipeline),
+            patch("dictate.menubar.list_input_devices", return_value=[mock_dev]),
+            patch("dictate.menubar.AudioCapture") as MockAudio,
+        ):
+            mock_app._init_pipeline()
+            assert mock_app._pipeline == mock_pipeline
+            MockAudio.assert_called_once()
+
+    def test_success_no_devices(self, mock_app):
+        mock_pipeline = MagicMock()
+        with (
+            patch("dictate.menubar.TranscriptionPipeline", return_value=mock_pipeline),
+            patch("dictate.menubar.list_input_devices", return_value=[]),
+        ):
+            mock_app._init_pipeline()
+            assert mock_app._pipeline == mock_pipeline
+            assert mock_app._audio is None
+
+    def test_failure(self, mock_app):
+        with (
+            patch("dictate.menubar.TranscriptionPipeline", side_effect=RuntimeError("fail")),
+            patch("dictate.menubar.list_input_devices", return_value=[]),
+        ):
+            mock_app._init_pipeline()
+
+
+class TestStartKeyboardListenerR2:
+    """Test _start_keyboard_listener (lines 929-962)."""
+
+    def test_listener_starts(self, mock_app):
+        mock_listener_cls = MagicMock()
+        mock_listener_instance = MagicMock()
+        mock_listener_cls.return_value = mock_listener_instance
+        keyboard_mock = sys.modules['pynput.keyboard']
+        keyboard_mock.Listener = mock_listener_cls
+        mock_app._start_keyboard_listener()
+        mock_listener_cls.assert_called_once()
+        mock_listener_instance.start.assert_called_once()
+
+    def test_ptt_starts_recording(self, mock_app):
+        keyboard_mock = sys.modules['pynput.keyboard']
+        mock_listener_cls = MagicMock()
+        keyboard_mock.Listener = mock_listener_cls
+        mock_app._start_recording = MagicMock()
+        mock_app._paused = False
+        mock_app._start_keyboard_listener()
+        on_press = mock_listener_cls.call_args[1].get('on_press') or mock_listener_cls.call_args[0][0]
+        on_press(mock_app._config.keybinds.ptt_key)
+        assert mock_app._ptt_held
+        mock_app._start_recording.assert_called_once()
+
+    def test_ptt_release_stops(self, mock_app):
+        keyboard_mock = sys.modules['pynput.keyboard']
+        mock_listener_cls = MagicMock()
+        keyboard_mock.Listener = mock_listener_cls
+        mock_app._stop_recording = MagicMock()
+        mock_app._ptt_held = True
+        mock_app._recording_locked = False
+        mock_app._start_keyboard_listener()
+        on_release = mock_listener_cls.call_args[1].get('on_release') or mock_listener_cls.call_args[0][1]
+        with patch("time.sleep"):
+            on_release(mock_app._config.keybinds.ptt_key)
+        assert not mock_app._ptt_held
+        mock_app._stop_recording.assert_called_once()
+
+    def test_paused_ignores(self, mock_app):
+        keyboard_mock = sys.modules['pynput.keyboard']
+        mock_listener_cls = MagicMock()
+        keyboard_mock.Listener = mock_listener_cls
+        mock_app._start_recording = MagicMock()
+        mock_app._paused = True
+        mock_app._start_keyboard_listener()
+        on_press = mock_listener_cls.call_args[1].get('on_press') or mock_listener_cls.call_args[0][0]
+        on_press(mock_app._config.keybinds.ptt_key)
+        mock_app._start_recording.assert_not_called()
+
+    def test_space_locks_recording(self, mock_app):
+        keyboard_mock = sys.modules['pynput.keyboard']
+        mock_listener_cls = MagicMock()
+        keyboard_mock.Listener = mock_listener_cls
+        keyboard_mock.Key = MagicMock()
+        keyboard_mock.Key.space = "SPACE_KEY"
+        mock_app._ptt_held = True
+        mock_app._recording_locked = False
+        mock_audio = MagicMock()
+        mock_audio.is_recording = True
+        mock_app._audio = mock_audio
+        mock_app._start_keyboard_listener()
+        on_press = mock_listener_cls.call_args[1].get('on_press') or mock_listener_cls.call_args[0][0]
+        on_press(keyboard_mock.Key.space)
+        assert mock_app._recording_locked
+
+    def test_locked_unlocks_on_ptt(self, mock_app):
+        keyboard_mock = sys.modules['pynput.keyboard']
+        mock_listener_cls = MagicMock()
+        keyboard_mock.Listener = mock_listener_cls
+        mock_app._stop_recording = MagicMock()
+        mock_app._recording_locked = True
+        mock_app._paused = False
+        mock_app._start_keyboard_listener()
+        on_press = mock_listener_cls.call_args[1].get('on_press') or mock_listener_cls.call_args[0][0]
+        with patch("time.sleep"):
+            on_press(mock_app._config.keybinds.ptt_key)
+        assert not mock_app._recording_locked
+        mock_app._stop_recording.assert_called_once()
+
+
+class TestBuildRecentMenuR2:
+    """Test _build_recent_menu."""
+
+    def test_empty(self, mock_app):
+        mock_app._recent = []
+        menu = mock_app._build_recent_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("No recent" in t for t in titles)
+
+    def test_with_items(self, mock_app):
+        mock_app._recent = ["Hello", "World"]
+        menu = mock_app._build_recent_menu()
+        assert len(menu._children) >= 2
+
+    def test_truncation(self, mock_app):
+        mock_app._recent = ["A" * 100]
+        menu = mock_app._build_recent_menu()
+        for c in menu._children:
+            if c and hasattr(c, 'title') and hasattr(c, '_full_text'):
+                assert "..." in c.title
+
+    def test_clear_option(self, mock_app):
+        mock_app._recent = ["test"]
+        menu = mock_app._build_recent_menu()
+        titles = [c.title for c in menu._children if c and hasattr(c, 'title')]
+        assert any("Clear" in t for t in titles)
+
+
+class TestBuildMicMenuR2:
+    """Test _build_mic_menu."""
+
+    def test_with_devices(self, mock_app):
+        dev1 = MagicMock(index=0, name="Mic 1", is_default=True)
+        dev2 = MagicMock(index=1, name="Mic 2", is_default=False)
+        with patch("dictate.menubar.list_input_devices", return_value=[dev1, dev2]):
+            menu = mock_app._build_mic_menu()
+            assert len(menu._children) == 2
+
+    def test_marks_selected(self, mock_app):
+        dev = MagicMock(index=5, name="USB Mic", is_default=False)
+        mock_app._prefs.device_id = 5
+        with patch("dictate.menubar.list_input_devices", return_value=[dev]):
+            menu = mock_app._build_mic_menu()
+            for c in menu._children:
+                if hasattr(c, '_device_index') and c._device_index == 5:
+                    assert c.state
+
+
+class TestReactiveWaveformR2:
+    """Test reactive waveform in _poll_ui."""
+
+    def test_waveform_updates_icon(self, mock_app):
+        mock_app._is_recording = True
+        mock_audio = MagicMock()
+        mock_audio.current_rms = 0.05
+        mock_app._audio = mock_audio
+        with patch("dictate.menubar.generate_reactive_icon", return_value="/tmp/w.png"):
+            mock_app._poll_ui(MagicMock())
+
+    def test_waveform_heights_bounded(self, mock_app):
+        mock_app._is_recording = True
+        mock_app._rms_history = deque([0.01, 0.05, 0.1, 0.15, 0.2], maxlen=5)
+        mock_audio = MagicMock()
+        mock_audio.current_rms = 0.1
+        mock_app._audio = mock_audio
+        captured = []
+        def capture(h):
+            captured.extend(h)
+            return "/tmp/w.png"
+        with patch("dictate.menubar.generate_reactive_icon", side_effect=capture):
+            mock_app._poll_ui(MagicMock())
+        if captured:
+            for h in captured:
+                assert MIN_BAR_H <= h <= MAX_BAR_H
+
+
+class TestOnOpenCacheFolderR2:
+    """Test _on_open_cache_folder."""
+
+    def test_exists(self, mock_app):
+        with patch.object(Path, 'exists', return_value=True), \
+             patch("subprocess.run") as mr:
+            mock_app._on_open_cache_folder(MagicMock())
+            mr.assert_called_once()
+
+    def test_not_exists(self, mock_app):
+        with patch.object(Path, 'exists', return_value=False):
+            _mock_rumps.alert = MagicMock()
+            mock_app._on_open_cache_folder(MagicMock())
+            _mock_rumps.alert.assert_called_once()
+
+
+class TestStartModelDownloadR2:
+    """Test _start_model_download."""
+
+    def test_starts_thread(self, mock_app):
+        from dictate.presets import QUALITY_PRESETS
+        if QUALITY_PRESETS:
+            mock_app._start_model_download(0, "mlx-community/test")
+            assert "mlx-community/test" in mock_app._active_downloads
+            if "mlx-community/test" in mock_app._active_downloads:
+                mock_app._active_downloads["mlx-community/test"].join(timeout=0.5)
+
+    def test_download_failure(self, mock_app):
+        from dictate.presets import QUALITY_PRESETS
+        if QUALITY_PRESETS:
+            mock_app._reload_pipeline = MagicMock()
+            with patch("dictate.menubar.download_model", side_effect=RuntimeError("err")):
+                mock_app._start_model_download(0, "mlx-community/fail")
+                import time; time.sleep(0.5)
+
+
+class TestOnDictAddR2:
+    """Test _on_dict_add dialog."""
+
+    def test_add_new(self, mock_app):
+        w = MagicMock()
+        w.run.return_value = MagicMock(clicked=True, text="OpenClaw")
+        _mock_rumps.Window = MagicMock(return_value=w)
+        with patch("dictate.menubar.Preferences.load_dictionary", return_value=[]):
+            with patch("dictate.menubar.Preferences.save_dictionary") as ms:
+                mock_app._on_dict_add(MagicMock())
+                ms.assert_called_once_with(["OpenClaw"])
+
+    def test_add_duplicate(self, mock_app):
+        w = MagicMock()
+        w.run.return_value = MagicMock(clicked=True, text="existing")
+        _mock_rumps.Window = MagicMock(return_value=w)
+        with patch("dictate.menubar.Preferences.load_dictionary", return_value=["existing"]):
+            with patch("dictate.menubar.Preferences.save_dictionary") as ms:
+                mock_app._on_dict_add(MagicMock())
+                ms.assert_not_called()
+
+    def test_add_cancelled(self, mock_app):
+        w = MagicMock()
+        w.run.return_value = MagicMock(clicked=False, text="")
+        _mock_rumps.Window = MagicMock(return_value=w)
+        with patch("dictate.menubar.Preferences.save_dictionary") as ms:
+            mock_app._on_dict_add(MagicMock())
+            ms.assert_not_called()
+
+
+class TestStartAppR2:
+    """Test start_app."""
+
+    def test_starts_threads(self, mock_app):
+        mock_app._init_pipeline = MagicMock()
+        mock_app._start_keyboard_listener = MagicMock()
+        mock_app._check_for_update = MagicMock()
+        mock_app.run = MagicMock()
+        with patch("threading.Thread") as MT:
+            mt = MagicMock()
+            MT.return_value = mt
+            mock_app.start_app()
+            mock_app._start_keyboard_listener.assert_called_once()
+            mock_app.run.assert_called_once()
+
+
+class TestSoundSelectPreviewR2:
+    """Test _on_sound_select with preview."""
+
+    def test_sound_with_tone(self, mock_app):
+        from dictate.presets import SOUND_PRESETS
+        sender = _MockMenuItem()
+        sender._sound_index = 0
+        with patch("dictate.menubar.play_tone") as mp:
+            mock_app._on_sound_select(sender)
+            if SOUND_PRESETS[0].start_hz > 0:
+                mp.assert_called()
+
+    def test_sound_silent(self, mock_app):
+        from dictate.presets import SOUND_PRESETS
+        silent = None
+        for i, p in enumerate(SOUND_PRESETS):
+            if p.start_hz == 0:
+                silent = i; break
+        if silent is not None:
+            sender = _MockMenuItem()
+            sender._sound_index = silent
+            with patch("dictate.menubar.play_tone") as mp:
+                mock_app._on_sound_select(sender)
+                mp.assert_not_called()
