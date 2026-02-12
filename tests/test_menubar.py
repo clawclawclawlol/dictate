@@ -1931,41 +1931,64 @@ class TestOnChunkReadyR4:
 
 
 class TestWorkerLoopR4:
-    """Test _worker_loop edge cases (lines 1018-1022)."""
+    """Test _worker_loop edge cases (lines 1016-1022).
 
-    def test_worker_loop_empty_continue(self, mock_app):
-        """Test that Empty exception causes continue (line 1018)."""
-        mock_app._stop_event.set()  # Stop immediately after first iteration
+    The loop is:
+      while not self._stop_event.is_set():
+          try: audio = self._work_queue.get(timeout=0.5)
+          except queue.Empty: continue       # lines 1016-1017
+          if self._stop_event.is_set(): break  # lines 1018-1019
+          if audio.size == 0: continue        # lines 1020-1021
+          self._process_chunk(audio)
 
-        # Don't put anything on the queue - should hit Empty and continue
-        # Then check stop_event and break
-        with patch('dictate.menubar.logger') as mock_logger:
+    To test inner lines, we use a mock _stop_event that returns
+    different values on successive is_set() calls.
+    """
+
+    def test_worker_loop_empty_then_stop(self, mock_app):
+        """Empty exception → continue, then while check sees stop → exit.
+        Covers: line 1016-1017 (Empty continue)."""
+        # Timer sets stop after 0.6s; loop enters, get() times out at 0.5s,
+        # Empty → continue, while re-checks → stop is set → exit
+        threading.Timer(0.6, mock_app._stop_event.set).start()
+        mock_app._worker_loop()
+
+    def test_worker_loop_stop_after_get_breaks(self, mock_app):
+        """Audio retrieved but stop_event set between while-check and if-check.
+        Covers: lines 1018-1019 (stop_event break after get)."""
+        audio = np.array([1, 2, 3], dtype=np.int16)
+        mock_app._work_queue.put(audio)
+
+        call_count = [0]
+        def is_set_returns():
+            call_count[0] += 1
+            return call_count[0] > 1  # False on while-check, True on if-check
+
+        mock_app._stop_event = MagicMock()
+        mock_app._stop_event.is_set = is_set_returns
+
+        with patch.object(mock_app, '_process_chunk') as mp:
             mock_app._worker_loop()
-            # Should complete without error
+            mp.assert_not_called()  # Broke before processing
+        assert call_count[0] == 2
 
-    def test_worker_loop_stop_event_break(self, mock_app):
-        """Test that stop_event causes break (line 1020-1022)."""
-        import numpy as np
-
-        mock_app._stop_event.set()
-        # Put something on queue but stop is set - should break before processing
-        mock_app._work_queue.put(np.zeros(10, dtype=np.int16))
-
-        mock_app._worker_loop()
-        # Item should still be on queue since we break before processing
-        # (or we processed it but that's fine too)
-
-    def test_worker_loop_zero_size_audio(self, mock_app):
-        """Test that zero-size audio is skipped (line 1021)."""
-        import numpy as np
-
-        mock_app._pipeline = MagicMock()
+    def test_worker_loop_zero_size_continue(self, mock_app):
+        """Zero-size audio → continue without processing.
+        Covers: lines 1020-1021 (zero-size continue)."""
         mock_app._work_queue.put(np.zeros(0, dtype=np.int16))
-        mock_app._stop_event.set()
 
-        mock_app._worker_loop()
-        # Should not call pipeline.process for empty audio
-        mock_app._pipeline.process.assert_not_called()
+        call_count = [0]
+        def is_set_returns():
+            call_count[0] += 1
+            # False for: while(1), if(2), while(3) → True on 3rd to exit
+            return call_count[0] > 2
+
+        mock_app._stop_event = MagicMock()
+        mock_app._stop_event.is_set = is_set_returns
+
+        with patch.object(mock_app, '_process_chunk') as mp:
+            mock_app._worker_loop()
+            mp.assert_not_called()  # Zero-size was skipped
 
 
 class TestShutdownR4:
@@ -1978,7 +2001,7 @@ class TestShutdownR4:
         mock_app._worker.is_alive.return_value = True
         mock_app._listener = MagicMock()
 
-        with patch('dictate.menubar.cleanup_temp_files'):
+        with patch.object(mock_app, '_cleanup_icon_temp_files'):
             mock_app.shutdown()
 
         mock_app._worker.join.assert_called_once_with(timeout=SHUTDOWN_TIMEOUT_SECONDS)
@@ -1989,7 +2012,7 @@ class TestShutdownR4:
         mock_app._worker = None
         mock_app._listener = MagicMock()
 
-        with patch('dictate.menubar.cleanup_temp_files'):
+        with patch.object(mock_app, '_cleanup_icon_temp_files'):
             mock_app.shutdown()
 
         mock_app._listener.stop.assert_called_once()
@@ -2001,16 +2024,15 @@ class TestCheckForUpdateR4:
     @patch('dictate.menubar.time.sleep')
     def test_update_check_large_response(self, mock_sleep, mock_app):
         """Test early return when response >= MAX_RESPONSE_BYTES (line 1094)."""
-        # Create a response that hits the size limit
-        fake_data = b'{"info": {"version": "99.0.0"}}' + b'x' * 2_000_000
+        fake_data = b'x' * 1_048_576  # Exactly MAX_RESPONSE_BYTES
         mock_resp = MagicMock()
-        mock_resp.read.return_value = fake_data[:1_048_576]  # MAX_RESPONSE_BYTES
+        mock_resp.read.return_value = fake_data
         mock_resp.__enter__ = MagicMock(return_value=mock_resp)
         mock_resp.__exit__ = MagicMock(return_value=False)
 
         with patch('urllib.request.urlopen', return_value=mock_resp):
             mock_app._check_for_update()
-            # Should return early due to size check
+            # Should return early — response suspiciously large
 
     @patch('dictate.menubar.time.sleep')
     def test_update_check_invalid_version_format(self, mock_sleep, mock_app):
