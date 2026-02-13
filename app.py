@@ -193,87 +193,18 @@ class Recorder:
         return (audio * 32767.0).astype(np.int16)
 
 
-class Pipeline:
+class SttEngine:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
-        self._kb = KeyboardController()
-        self._has_output = False
         self._stt_model = self._build_stt()
-        self._paste_mod = keyboard.Key.cmd if platform.system() == "Darwin" else keyboard.Key.ctrl
-        self._mouse = MouseController()
         self._context_text = ""
         self._prev_audio_tail: np.ndarray | None = None
         self._last_emitted_words: list[str] = []
-        if self.cfg.cleanup and not self.cfg.ollama_model:
-            self.cfg.ollama_model = self._default_ollama_model()
 
     def reset_context(self) -> None:
         self._context_text = ""
         self._prev_audio_tail = None
         self._last_emitted_words = []
-
-    def _build_stt(self):
-        from faster_whisper import WhisperModel
-
-        device = self.cfg.stt_device
-        compute_type = self.cfg.stt_compute_type
-        started = time.time()
-        print(
-            f"loading stt model '{self.cfg.stt_model}' "
-            f"(device={device}, compute={compute_type})...",
-            flush=True,
-        )
-        try:
-            model = WhisperModel(self.cfg.stt_model, device=device, compute_type=compute_type)
-            print(f"stt model ready in {time.time() - started:.1f}s (device={device})", flush=True)
-            return model
-        except RuntimeError as e:
-            msg = str(e).lower()
-            if device == "auto" and compute_type == "float16" and ("float16" in msg or "compute type" in msg):
-                print("stt init: float16 unsupported on auto-selected backend, retrying int8")
-                retry_started = time.time()
-                model = WhisperModel(self.cfg.stt_model, device="auto", compute_type="int8")
-                print(
-                    f"stt model ready in {time.time() - retry_started:.1f}s (device=auto, compute=int8)",
-                    flush=True,
-                )
-                return model
-            if "cublas" in msg or "cuda" in msg:
-                print("stt init: cuda unavailable, falling back to cpu")
-                fallback_started = time.time()
-                model = WhisperModel(self.cfg.stt_model, device="cpu", compute_type="int8")
-                print(
-                    f"stt model ready in {time.time() - fallback_started:.1f}s (device=cpu fallback)",
-                    flush=True,
-                )
-                return model
-            raise
-
-    def _default_ollama_model(self) -> str:
-        try:
-            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
-            resp.raise_for_status()
-            models = resp.json().get("models", [])
-            if models:
-                return str(models[0].get("name", ""))
-        except Exception:
-            pass
-        return ""
-
-    @staticmethod
-    def _is_cuda_runtime_failure(exc: BaseException) -> bool:
-        msg = str(exc).lower()
-        return ("libcublas" in msg) or ("cuda" in msg)
-
-    def _switch_stt_to_cpu(self) -> None:
-        from faster_whisper import WhisperModel
-
-        started = time.time()
-        print("stt runtime: cuda failure detected, switching to cpu/int8", flush=True)
-        self.cfg.stt_device = "cpu"
-        self.cfg.stt_compute_type = "int8"
-        self._stt_model = WhisperModel(self.cfg.stt_model, device="cpu", compute_type="int8")
-        print(f"stt model ready in {time.time() - started:.1f}s (device=cpu runtime fallback)", flush=True)
 
     def transcribe(self, audio_i16: np.ndarray) -> str:
         if audio_i16.size == 0:
@@ -352,36 +283,116 @@ class Pipeline:
             with contextlib.suppress(OSError):
                 os.remove(wav_path)
 
-    def cleanup(self, text: str) -> str:
-        if not text or not self.cfg.cleanup or not self.cfg.ollama_model:
-            return text
-        if self._looks_clean(text):
-            return text
+    def _build_stt(self):
+        from faster_whisper import WhisperModel
 
-        payload = {
-            "model": self.cfg.ollama_model,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a dictation post-processor. "
-                        "Fix punctuation and capitalization only. "
-                        "Do not add ideas. Output only corrected text."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-        }
-
+        device = self.cfg.stt_device
+        compute_type = self.cfg.stt_compute_type
+        started = time.time()
+        print(
+            f"loading stt model '{self.cfg.stt_model}' "
+            f"(device={device}, compute={compute_type})...",
+            flush=True,
+        )
         try:
-            resp = requests.post(self.cfg.ollama_url, json=payload, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            content = data.get("message", {}).get("content", "")
-            return self._postprocess(str(content).strip()) or text
-        except Exception:
+            model = WhisperModel(self.cfg.stt_model, device=device, compute_type=compute_type)
+            print(f"stt model ready in {time.time() - started:.1f}s (device={device})", flush=True)
+            return model
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if device == "auto" and compute_type == "float16" and ("float16" in msg or "compute type" in msg):
+                print("stt init: float16 unsupported on auto-selected backend, retrying int8")
+                retry_started = time.time()
+                model = WhisperModel(self.cfg.stt_model, device="auto", compute_type="int8")
+                print(
+                    f"stt model ready in {time.time() - retry_started:.1f}s (device=auto, compute=int8)",
+                    flush=True,
+                )
+                return model
+            if "cublas" in msg or "cuda" in msg:
+                print("stt init: cuda unavailable, falling back to cpu")
+                fallback_started = time.time()
+                model = WhisperModel(self.cfg.stt_model, device="cpu", compute_type="int8")
+                print(
+                    f"stt model ready in {time.time() - fallback_started:.1f}s (device=cpu fallback)",
+                    flush=True,
+                )
+                return model
+            raise
+
+    @staticmethod
+    def _is_cuda_runtime_failure(exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return ("libcublas" in msg) or ("cuda" in msg)
+
+    def _switch_stt_to_cpu(self) -> None:
+        from faster_whisper import WhisperModel
+
+        started = time.time()
+        print("stt runtime: cuda failure detected, switching to cpu/int8", flush=True)
+        self.cfg.stt_device = "cpu"
+        self.cfg.stt_compute_type = "int8"
+        self._stt_model = WhisperModel(self.cfg.stt_model, device="cpu", compute_type="int8")
+        print(f"stt model ready in {time.time() - started:.1f}s (device=cpu runtime fallback)", flush=True)
+
+    @staticmethod
+    def _dedup(text: str) -> str:
+        words = text.split()
+        n = len(words)
+        if n < 4:
             return text
+        half = n // 2
+        if " ".join(words[:half]).lower() == " ".join(words[half : half * 2]).lower():
+            return " ".join(words[:half])
+        return text
+
+    def _trim_prefix_overlap(self, text: str) -> str:
+        if not text:
+            return text
+        new_words = text.split()
+        old_words = self._last_emitted_words
+        if not new_words or not old_words:
+            return text
+        max_k = min(len(new_words), len(old_words), 24)
+        overlap = 0
+        for k in range(max_k, 0, -1):
+            if [w.lower() for w in new_words[:k]] == [w.lower() for w in old_words[-k:]]:
+                overlap = k
+                break
+        if overlap > 0:
+            new_words = new_words[overlap:]
+        return " ".join(new_words).strip()
+
+    def _trim_first_word_overlap(self, text: str) -> str:
+        if not text or not self._last_emitted_words:
+            return text
+        new_words = text.split()
+        if not new_words:
+            return text
+        norm_prev = [self._normalize_word(w) for w in self._last_emitted_words]
+        norm_new = [self._normalize_word(w) for w in new_words]
+        max_k = min(3, len(norm_prev), len(norm_new))
+        trim_n = 0
+        for k in range(max_k, 0, -1):
+            if all(norm_prev[-k + i] and norm_new[i] and norm_prev[-k + i] == norm_new[i] for i in range(k)):
+                trim_n = k
+                break
+        if trim_n > 0:
+            new_words = new_words[trim_n:]
+        return " ".join(new_words).strip()
+
+    @staticmethod
+    def _normalize_word(word: str) -> str:
+        return re.sub(r"^[^\w]+|[^\w]+$", "", word.lower())
+
+
+class OutputSink:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._kb = KeyboardController()
+        self._mouse = MouseController()
+        self._paste_mod = keyboard.Key.cmd if platform.system() == "Darwin" else keyboard.Key.ctrl
+        self._has_output = False
 
     def output(self, text: str) -> None:
         if not text or not self.cfg.paste:
@@ -515,16 +526,65 @@ class Pipeline:
                 pass
         return "unknown"
 
-    @staticmethod
-    def _dedup(text: str) -> str:
-        words = text.split()
-        n = len(words)
-        if n < 4:
+
+class Pipeline:
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
+        self._stt = SttEngine(cfg)
+        self._output = OutputSink(cfg)
+        if self.cfg.cleanup and not self.cfg.ollama_model:
+            self.cfg.ollama_model = self._default_ollama_model()
+
+    def reset_context(self) -> None:
+        self._stt.reset_context()
+
+    def _default_ollama_model(self) -> str:
+        try:
+            resp = requests.get("http://localhost:11434/api/tags", timeout=2)
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            if models:
+                return str(models[0].get("name", ""))
+        except Exception:
+            pass
+        return ""
+
+    def transcribe(self, audio_i16: np.ndarray) -> str:
+        return self._stt.transcribe(audio_i16)
+
+    def cleanup(self, text: str) -> str:
+        if not text or not self.cfg.cleanup or not self.cfg.ollama_model:
             return text
-        half = n // 2
-        if " ".join(words[:half]).lower() == " ".join(words[half : half * 2]).lower():
-            return " ".join(words[:half])
-        return text
+        if self._looks_clean(text):
+            return text
+
+        payload = {
+            "model": self.cfg.ollama_model,
+            "stream": False,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a dictation post-processor. "
+                        "Fix punctuation and capitalization only. "
+                        "Do not add ideas. Output only corrected text."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        }
+
+        try:
+            resp = requests.post(self.cfg.ollama_url, json=payload, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+            content = data.get("message", {}).get("content", "")
+            return self._postprocess(str(content).strip()) or text
+        except Exception:
+            return text
+
+    def output(self, text: str) -> None:
+        self._output.output(text)
 
     @staticmethod
     def _looks_clean(text: str) -> bool:
@@ -554,46 +614,6 @@ class Pipeline:
         if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
             text = text[1:-1]
         return text.strip()
-
-    def _trim_prefix_overlap(self, text: str) -> str:
-        if not text:
-            return text
-        new_words = text.split()
-        old_words = self._last_emitted_words
-        if not new_words or not old_words:
-            return text
-        max_k = min(len(new_words), len(old_words), 24)
-        overlap = 0
-        for k in range(max_k, 0, -1):
-            if [w.lower() for w in new_words[:k]] == [w.lower() for w in old_words[-k:]]:
-                overlap = k
-                break
-        if overlap > 0:
-            new_words = new_words[overlap:]
-        return " ".join(new_words).strip()
-
-    def _trim_first_word_overlap(self, text: str) -> str:
-        if not text or not self._last_emitted_words:
-            return text
-        new_words = text.split()
-        if not new_words:
-            return text
-        norm_prev = [self._normalize_word(w) for w in self._last_emitted_words]
-        norm_new = [self._normalize_word(w) for w in new_words]
-        max_k = min(3, len(norm_prev), len(norm_new))
-        trim_n = 0
-        for k in range(max_k, 0, -1):
-            if all(norm_prev[-k + i] and norm_new[i] and norm_prev[-k + i] == norm_new[i] for i in range(k)):
-                trim_n = k
-                break
-        if trim_n > 0:
-            new_words = new_words[trim_n:]
-        return " ".join(new_words).strip()
-
-    @staticmethod
-    def _normalize_word(word: str) -> str:
-        return re.sub(r"^[^\w]+|[^\w]+$", "", word.lower())
-
 
 def resolve_ptt_key(name: str) -> keyboard.Key:
     mapping = {
@@ -720,6 +740,19 @@ def _resume_media_playback() -> None:
             timeout=1,
             check=False,
         )
+
+
+def _media_was_playing() -> bool:
+    # Best-effort probe of current playback state.
+    with contextlib.suppress(Exception):
+        out = subprocess.check_output(
+            ["playerctl", "status"],
+            text=True,
+            timeout=1,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return out.lower() == "playing"
+    return False
 
 
 def main() -> int:
@@ -953,13 +986,17 @@ def main() -> int:
     t.start()
 
     held = False
+    media_was_playing_on_press = False
 
     def on_press(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held
+        nonlocal held, media_was_playing_on_press
         if cfg.debug and cfg.debug_keys:
             dlog(f"key press: {k!r} matches_ptt={k == ptt_key}")
         if k == ptt_key and not held:
             held = True
+            if cfg.mode == "ptt" and cfg.ptt_auto_resume_media and platform.system() == "Linux":
+                media_was_playing_on_press = _media_was_playing()
+                dlog(f"ptt press: media_was_playing={media_was_playing_on_press}")
             try:
                 recorder.start()
                 show_ptt_indicator()
@@ -969,7 +1006,7 @@ def main() -> int:
                 print(f"record start failed: {e}")
 
     def on_release(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held
+        nonlocal held, media_was_playing_on_press
         if cfg.debug and cfg.debug_keys:
             dlog(f"key release: {k!r} matches_ptt={k == ptt_key}")
         if k == ptt_key and held:
@@ -978,8 +1015,12 @@ def main() -> int:
             work_q.put(audio)
             dlog("ptt released: queued audio chunk")
             if cfg.mode == "ptt" and cfg.ptt_auto_resume_media and platform.system() == "Linux":
-                _resume_media_playback()
-                dlog("ptt release: requested media resume via playerctl")
+                if media_was_playing_on_press:
+                    _resume_media_playback()
+                    dlog("ptt release: requested media resume via playerctl")
+                else:
+                    dlog("ptt release: media was not playing on press, skip resume")
+                media_was_playing_on_press = False
 
     if cfg.mode == "ptt":
         print(
