@@ -42,7 +42,13 @@ dictate-min --list-input-devices
 
 ### Push-to-talk mode
 - `DICTATE_PTT_KEY`: `cmd_r`, `super_r`, `cmd_l`, `super_l`, `super`, `win`, `shift_r`, `shift_l`, `ctrl_l`, `ctrl_r`, `alt_l`, `alt_r` (default `ctrl_r`)
-- `DICTATE_PTT_AUTO_RESUME_MEDIA`: on PTT release, run `playerctl play` to recover paused playback (Linux, default `1`)
+- `DICTATE_PTT_AUTO_PAUSE_MEDIA`: on PTT press, run `playerctl -a pause` to pause media playback (Linux, default `1`)
+- `DICTATE_PTT_DUCK_MEDIA`: on PTT press, lower default sink volume and restore it on release (Linux, default `0`)
+- `DICTATE_PTT_DUCK_SCOPE`: duck target scope when ducking is enabled: `default` or `all` (ducks all non-monitor sinks) (default `default`)
+- `DICTATE_PTT_DUCK_MEDIA_PERCENT`: target volume while PTT is held when ducking is enabled (default `30`)
+- `DICTATE_PTT_AUTO_SUBMIT`: press Enter after emitting a PTT chunk; hold Shift while releasing PTT to suppress for that chunk (default `0`)
+- On Linux PTT release, only players that were playing on press (and are paused at release) are resumed.
+- If both ducking and auto-pause are enabled, ducking takes precedence on PTT press.
 
 ### Loopback mode
 - `DICTATE_LOOPBACK_CHUNK_S`: chunk size in seconds (default `4`)
@@ -50,10 +56,28 @@ dictate-min --list-input-devices
 - `DICTATE_PULSE_SOURCE`: force pulse source name, e.g. `jamesdsp_sink.monitor`
 - `DICTATE_MIN_CHUNK_RMS`: skip near-silent chunks below threshold (default `0.0008`)
 
-### Cleanup model (Ollama)
+### Cleanup model
 - `DICTATE_CLEANUP`: enable cleanup pass (`1`/`0`, default `1`)
-- `DICTATE_OLLAMA_URL`: cleanup endpoint (default `http://localhost:11434/api/chat`)
-- `DICTATE_OLLAMA_MODEL`: cleanup model name (default auto-pick first local model)
+- `DICTATE_CLEANUP_BACKEND`: cleanup backend: `ollama` (default) or `generic_v1` (`api_v1`/`lm_api_v1` aliases)
+- `DICTATE_CLEANUP_URL`: cleanup endpoint URL (defaults to `DICTATE_OLLAMA_URL` if set, else `http://localhost:11434/api/chat`)
+  - for `generic_v1`, if this is just a base URL like `http://host:1234`, app auto-uses `http://host:1234/v1/chat`
+- `DICTATE_CLEANUP_MODEL`: cleanup model name (defaults to `DICTATE_OLLAMA_MODEL`; auto-pick for `ollama` when empty; for `generic_v1`, attempts discovery from `/api/v1/models` or `/v1/models` and picks a single loaded model, else a single available model)
+- `DICTATE_CLEANUP_API_TOKEN`: bearer token for cleanup backend auth (or set `LM_API_TOKEN`)
+- `DICTATE_CLEANUP_PROMPT`: system prompt for cleanup model (default: "You are a dictation post-processor. Fix punctuation and capitalization only. Do not add ideas. Output only corrected text.")
+- `DICTATE_CLEANUP_PROMPTS`: slash-rule overrides by active window title, format: `/match/prompt,/other/prompt2` or `/match/prompt ;; /other/prompt2 ;; default prompt`
+  - matching is case-insensitive substring against active window title
+  - if multiple rules match, only the last matching rule is sent
+  - if none match, the default prompt is used (when provided in `;; default prompt` form), else `DICTATE_CLEANUP_PROMPT`
+  - prompt templates support placeholders:
+    - current: `{input}`, `{target}`, `{backend}`, `{model}`
+    - previous single: `{prev_input}`, `{prev_output}`, `{prev_prompt}`
+    - previous indexed (most recent first): `{prev_input_1}`, `{prev_input_2}`, `{prev_output_1}`, `{prev_prompt_1}`, etc.
+    - full buffer (joined by newlines): `{buffer_inputs}`, `{buffer_outputs}`, `{buffer_prompts}`
+  - example: `DICTATE_CLEANUP_PROMPTS="/terminal/Output only shell-safe text. Keep commands exact.,/code/Preserve code tokens exactly; only fix punctuation around prose."`
+- `DICTATE_CLEANUP_REASONING`: for `generic_v1` payloads (default `off`)
+- `DICTATE_CLEANUP_TEMPERATURE`: for `generic_v1` payloads (default `0.2`)
+- `DICTATE_CLEANUP_HISTORY_SIZE`: number of prior cleanup exchanges kept for template placeholders (default `12`)
+- `DICTATE_OLLAMA_URL` / `DICTATE_OLLAMA_MODEL`: legacy compatibility aliases still supported
 
 ### Whisper-specific
 
@@ -71,9 +95,10 @@ dictate-min --list-input-devices
 #### Context + overlap
 - `DICTATE_CONTEXT`: enable text context carryover (`1`/`0`, default `1`)
 - `DICTATE_CONTEXT_CHARS`: max retained text context chars (default `600`)
-- `DICTATE_CONTEXT_RESET_EVERY`: reset context every N emitted chunks (`0` disables, default `0`)
+- `DICTATE_CONTEXT_RESET_EVERY`: reset context every N emitted chunks (`0` disables, default `1`)
 - `DICTATE_AUDIO_CONTEXT_S`: prepended previous-audio seconds per chunk (default `1.6`)
 - `DICTATE_AUDIO_CONTEXT_PAD_S`: overlap pad used for timestamp clipping (default `0.12`)
+- `DICTATE_STT_TAIL_PAD_S`: append trailing silence before Whisper decode to reduce end-of-chunk hallucinations (default `0.08`)
 - `DICTATE_TRIM_CHUNK_PERIOD`: trim trailing `.`/`...` from chunk output (default `1`)
 
 #### Loop/failure protection

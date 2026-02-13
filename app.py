@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections import deque
 import os
 import platform
 import queue
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -24,6 +26,12 @@ from pynput.mouse import Button as MouseButton
 from pynput.mouse import Controller as MouseController
 from scipy.signal import resample_poly
 from scipy.io.wavfile import write as wav_write
+
+DEFAULT_CLEANUP_PROMPT = (
+    "You are a dictation post-processor. "
+    "Fix punctuation and capitalization only. "
+    "Do not add ideas. Output only corrected text."
+)
 
 
 def env_int(name: str, default: int) -> int:
@@ -43,6 +51,14 @@ def env_bool(name: str, default: bool) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
+def env_bool_renamed(name: str, old_name: str, default: bool) -> bool:
+    if name in os.environ:
+        return env_bool(name, default)
+    if old_name in os.environ:
+        return env_bool(old_name, default)
+    return default
+
+
 def env_float(name: str, default: float) -> float:
     value = os.environ.get(name)
     if value is None:
@@ -51,6 +67,72 @@ def env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError:
         return default
+
+
+def parse_cleanup_prompts(
+    spec: str,
+    fallback_default: str,
+) -> tuple[str, list[tuple[str, str]]]:
+    default_prompt = fallback_default
+    rules: list[tuple[str, str]] = []
+    s = (spec or "").strip()
+    if not s:
+        return default_prompt, rules
+
+    parts = [part.strip() for part in s.split(";;") if part.strip()]
+    for part in parts:
+        if not part.startswith("/"):
+            default_prompt = part
+            continue
+
+        rem = part
+        while rem.startswith("/") and rem.count("/") >= 2:
+            second = rem.find("/", 1)
+            if second <= 1:
+                break
+            pattern = rem[1:second].strip()
+            rest = rem[second + 1 :]
+            # Allow chained rules like "/a/prompt,/b/prompt2"
+            nxt = re.search(r"\s*,\s*/", rest)
+            if nxt:
+                prompt = rest[: nxt.start()].strip()
+                rem = rest[nxt.end() - 1 :].strip()  # keep leading "/" for next rule
+            else:
+                prompt = rest.strip()
+                rem = ""
+            if pattern and prompt:
+                rules.append((pattern.lower(), prompt))
+            if not rem:
+                break
+
+        if rem and not rem.startswith("/"):
+            default_prompt = rem.strip()
+    return default_prompt, rules
+
+
+def render_cleanup_template(
+    template: str,
+    values: dict[str, str],
+    indexed_values: dict[str, list[str]] | None = None,
+) -> str:
+    s = template or ""
+    for key, value in values.items():
+        s = s.replace("{" + key + "}", value)
+    if indexed_values:
+        # Indexed placeholders use 1-based recent history:
+        # {prev_prompt_1} is most recent previous prompt.
+        pat = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)_(\d+)\}")
+
+        def repl(match: re.Match[str]) -> str:
+            name = match.group(1)
+            idx = int(match.group(2))
+            seq = indexed_values.get(name, [])
+            if idx <= 0 or idx > len(seq):
+                return ""
+            return seq[idx - 1]
+
+        s = pat.sub(repl, s)
+    return s
 
 
 @dataclass
@@ -68,10 +150,24 @@ class Config:
     stt_no_speech_threshold: float = env_float("DICTATE_STT_NO_SPEECH_THRESHOLD", 0.6)
     stt_log_prob_threshold: float = env_float("DICTATE_STT_LOGPROB_THRESHOLD", -1.0)
     stt_compression_ratio_threshold: float = env_float("DICTATE_STT_COMPRESSION_RATIO_THRESHOLD", 2.4)
+    stt_tail_pad_s: float = env_float("DICTATE_STT_TAIL_PAD_S", 0.08)
     input_language: str = os.environ.get("DICTATE_INPUT_LANGUAGE", "auto")
     cleanup: bool = env_bool("DICTATE_CLEANUP", True)
-    ollama_url: str = os.environ.get("DICTATE_OLLAMA_URL", "http://localhost:11434/api/chat")
-    ollama_model: str = os.environ.get("DICTATE_OLLAMA_MODEL", "")
+    cleanup_prompt: str = os.environ.get("DICTATE_CLEANUP_PROMPT", DEFAULT_CLEANUP_PROMPT)
+    cleanup_prompts: str = os.environ.get("DICTATE_CLEANUP_PROMPTS", "")
+    cleanup_backend: str = os.environ.get("DICTATE_CLEANUP_BACKEND", "ollama").lower()
+    cleanup_url: str = os.environ.get(
+        "DICTATE_CLEANUP_URL",
+        os.environ.get("DICTATE_OLLAMA_URL", "http://localhost:11434/api/chat"),
+    )
+    cleanup_model: str = os.environ.get(
+        "DICTATE_CLEANUP_MODEL",
+        os.environ.get("DICTATE_OLLAMA_MODEL", ""),
+    )
+    cleanup_api_token: str = os.environ.get("LM_API_TOKEN", os.environ.get("DICTATE_CLEANUP_API_TOKEN", ""))
+    cleanup_reasoning: str = os.environ.get("DICTATE_CLEANUP_REASONING", "off")
+    cleanup_temperature: float = env_float("DICTATE_CLEANUP_TEMPERATURE", 0.2)
+    cleanup_history_size: int = env_int("DICTATE_CLEANUP_HISTORY_SIZE", 12)
     mode: str = os.environ.get("DICTATE_MODE", "ptt").lower()
     loopback_chunk_s: int = env_int("DICTATE_LOOPBACK_CHUNK_S", 4)
     loopback_hint: str = os.environ.get("DICTATE_LOOPBACK_HINT", "loopback pcm").lower()
@@ -87,11 +183,19 @@ class Config:
     min_chunk_rms: float = env_float("DICTATE_MIN_CHUNK_RMS", 0.0008)
     context_enabled: bool = env_bool("DICTATE_CONTEXT", True)
     context_chars: int = env_int("DICTATE_CONTEXT_CHARS", 600)
-    context_reset_every: int = env_int("DICTATE_CONTEXT_RESET_EVERY", 0)
+    context_reset_every: int = env_int("DICTATE_CONTEXT_RESET_EVERY", 1)
     audio_context_s: float = env_float("DICTATE_AUDIO_CONTEXT_S", 1.6)
     audio_context_pad_s: float = env_float("DICTATE_AUDIO_CONTEXT_PAD_S", 0.12)
     trim_chunk_terminal_period: bool = env_bool("DICTATE_TRIM_CHUNK_PERIOD", True)
-    ptt_auto_resume_media: bool = env_bool("DICTATE_PTT_AUTO_RESUME_MEDIA", True)
+    ptt_auto_pause_media: bool = env_bool_renamed(
+        "DICTATE_PTT_AUTO_PAUSE_MEDIA",
+        "DICTATE_PTT_AUTO_RESUME_MEDIA",
+        True,
+    )
+    ptt_duck_media: bool = env_bool("DICTATE_PTT_DUCK_MEDIA", False)
+    ptt_duck_scope: str = os.environ.get("DICTATE_PTT_DUCK_SCOPE", "default").lower()
+    ptt_duck_media_percent: int = env_int("DICTATE_PTT_DUCK_MEDIA_PERCENT", 30)
+    ptt_auto_submit: bool = env_bool("DICTATE_PTT_AUTO_SUBMIT", False)
     loop_guard_enabled: bool = env_bool("DICTATE_LOOP_GUARD", True)
     loop_guard_max_repeat_ratio: float = env_float("DICTATE_LOOP_GUARD_REPEAT_RATIO", 0.55)
     loop_guard_max_punct_ratio: float = env_float("DICTATE_LOOP_GUARD_PUNCT_RATIO", 0.35)
@@ -222,7 +326,9 @@ class SttEngine:
             else np.zeros((0,), dtype=np.float32)
         )
         prepended_s = len(context_audio) / stt_rate
-        combined_f32 = np.concatenate([context_audio, audio_f32], dtype=np.float32)
+        tail_pad_samples = int(max(0.0, self.cfg.stt_tail_pad_s) * stt_rate)
+        tail_pad = np.zeros((tail_pad_samples,), dtype=np.float32)
+        combined_f32 = np.concatenate([context_audio, audio_f32, tail_pad], dtype=np.float32)
         combined_i16 = np.clip(combined_f32 * 32767.0, -32768, 32767).astype(np.int16)
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
@@ -418,6 +524,13 @@ class OutputSink:
                 self._paste_with_shortcut()
         self._has_output = True
 
+    def submit(self) -> None:
+        self._kb.press(keyboard.Key.enter)
+        self._kb.release(keyboard.Key.enter)
+
+    def active_target_desc(self) -> str:
+        return self._active_window_desc()
+
     def _debug_log(self, msg: str) -> None:
         if self.cfg.debug:
             print(f"[debug {time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -532,8 +645,18 @@ class Pipeline:
         self.cfg = cfg
         self._stt = SttEngine(cfg)
         self._output = OutputSink(cfg)
-        if self.cfg.cleanup and not self.cfg.ollama_model:
-            self.cfg.ollama_model = self._default_ollama_model()
+        self._default_cleanup_prompt, self._cleanup_prompt_rules = parse_cleanup_prompts(
+            self.cfg.cleanup_prompts,
+            self.cfg.cleanup_prompt or DEFAULT_CLEANUP_PROMPT,
+        )
+        history_size = max(1, int(self.cfg.cleanup_history_size))
+        self._cleanup_input_history: deque[str] = deque(maxlen=history_size)
+        self._cleanup_output_history: deque[str] = deque(maxlen=history_size)
+        self._cleanup_prompt_history: deque[str] = deque(maxlen=history_size)
+        if self.cfg.cleanup and self.cfg.cleanup_backend == "ollama" and not self.cfg.cleanup_model:
+            self.cfg.cleanup_model = self._default_ollama_model()
+        if self.cfg.cleanup and self.cfg.cleanup_backend in {"generic_v1", "api_v1", "lm_api_v1"} and not self.cfg.cleanup_model:
+            self.cfg.cleanup_model = self._default_generic_model()
 
     def reset_context(self) -> None:
         self._stt.reset_context()
@@ -549,42 +672,238 @@ class Pipeline:
             pass
         return ""
 
+    def _default_generic_model(self) -> str:
+        base = self.cfg.cleanup_url.rstrip("/")
+        candidates: list[str] = []
+        if base.endswith("/api/v1/chat"):
+            root = base[: -len("/api/v1/chat")]
+            candidates.extend([root + "/api/v1/models", root + "/v1/models"])
+        elif base.endswith("/v1/chat"):
+            root = base[: -len("/v1/chat")]
+            candidates.extend([root + "/v1/models", root + "/api/v1/models"])
+        else:
+            candidates.extend([base + "/api/v1/models", base + "/v1/models"])
+        seen: set[str] = set()
+        uniq = [u for u in candidates if not (u in seen or seen.add(u))]
+        headers = {}
+        if self.cfg.cleanup_api_token:
+            headers["Authorization"] = f"Bearer {self.cfg.cleanup_api_token}"
+
+        for url in uniq:
+            try:
+                resp = requests.get(url, headers=headers, timeout=3)
+                resp.raise_for_status()
+                data = resp.json()
+                model = self._pick_model_from_listing(data)
+                if model:
+                    return model
+            except Exception:
+                continue
+        return ""
+
+    @staticmethod
+    def _pick_model_from_listing(data: object) -> str:
+        if not isinstance(data, dict):
+            return ""
+
+        # OpenAI-style: {"data":[{"id":"..."}]}
+        listing = data.get("data")
+        if isinstance(listing, list):
+            ids = [str(item.get("id", "")).strip() for item in listing if isinstance(item, dict)]
+            ids = [x for x in ids if x]
+            if len(ids) == 1:
+                return ids[0]
+
+        # Generic style: {"models":[{key, loaded_instances:[...]}]}
+        models = data.get("models")
+        if isinstance(models, list):
+            loaded_keys: list[str] = []
+            all_keys: list[str] = []
+            for item in models:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "")).strip()
+                mtype = str(item.get("type", "")).strip().lower()
+                if not key or (mtype and mtype != "llm"):
+                    continue
+                all_keys.append(key)
+                loaded = item.get("loaded_instances")
+                if isinstance(loaded, list) and loaded:
+                    loaded_keys.append(key)
+            if len(loaded_keys) == 1:
+                return loaded_keys[0]
+            if len(all_keys) == 1:
+                return all_keys[0]
+        return ""
+
     def transcribe(self, audio_i16: np.ndarray) -> str:
         return self._stt.transcribe(audio_i16)
 
-    def cleanup(self, text: str) -> str:
-        if not text or not self.cfg.cleanup or not self.cfg.ollama_model:
+    def cleanup(self, text: str, target_desc: str = "") -> str:
+        if not text or not self.cfg.cleanup:
             return text
-        if self._looks_clean(text):
+        if self.cfg.cleanup_backend == "ollama" and not self.cfg.cleanup_model:
+            return text
+        if self._looks_clean(text) and not self._cleanup_prompt_rules:
             return text
 
-        payload = {
-            "model": self.cfg.ollama_model,
-            "stream": False,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a dictation post-processor. "
-                        "Fix punctuation and capitalization only. "
-                        "Do not add ideas. Output only corrected text."
-                    ),
-                },
-                {"role": "user", "content": text},
-            ],
-        }
+        backend = self.cfg.cleanup_backend
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.cleanup_api_token:
+            headers["Authorization"] = f"Bearer {self.cfg.cleanup_api_token}"
+        raw_system_prompt = self._resolve_cleanup_prompt(target_desc)
+        prev_inputs = list(reversed(self._cleanup_input_history))
+        prev_outputs = list(reversed(self._cleanup_output_history))
+        prev_prompts = list(reversed(self._cleanup_prompt_history))
+        system_prompt = render_cleanup_template(
+            raw_system_prompt,
+            {
+                "input": text,
+                "target": target_desc,
+                "backend": backend,
+                "model": self.cfg.cleanup_model or "",
+                "prev_input": prev_inputs[0] if prev_inputs else "",
+                "prev_output": prev_outputs[0] if prev_outputs else "",
+                "prev_prompt": prev_prompts[0] if prev_prompts else "",
+                "buffer_inputs": "\n".join(prev_inputs),
+                "buffer_outputs": "\n".join(prev_outputs),
+                "buffer_prompts": "\n".join(prev_prompts),
+            },
+            {
+                "prev_input": prev_inputs,
+                "prev_output": prev_outputs,
+                "prev_prompt": prev_prompts,
+            },
+        )
+        result = text
+        if backend == "ollama":
+            payload = {
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": text},
+                ],
+            }
+            if self.cfg.cleanup_model:
+                payload["model"] = self.cfg.cleanup_model
+        elif backend in {"generic_v1", "api_v1", "lm_api_v1"}:
+            payload = {
+                "system_prompt": system_prompt,
+                "input": text,
+                "reasoning": self.cfg.cleanup_reasoning,
+                "temperature": self.cfg.cleanup_temperature,
+            }
+            if self.cfg.cleanup_model:
+                payload["model"] = self.cfg.cleanup_model
+        else:
+            return text
 
         try:
-            resp = requests.post(self.cfg.ollama_url, json=payload, timeout=20)
+            self._cleanup_debug(
+                "request "
+                f"backend={backend} url={self.cfg.cleanup_url} "
+                f"model={self.cfg.cleanup_model or '<empty>'} text_len={len(text)}"
+            )
+            resp = requests.post(self.cfg.cleanup_url, json=payload, headers=headers, timeout=20)
             resp.raise_for_status()
             data = resp.json()
-            content = data.get("message", {}).get("content", "")
-            return self._postprocess(str(content).strip()) or text
-        except Exception:
-            return text
+            if isinstance(data, dict):
+                self._cleanup_debug(f"response status={resp.status_code} keys={sorted(data.keys())}")
+            else:
+                self._cleanup_debug(f"response status={resp.status_code} type={type(data).__name__}")
+            if backend == "ollama":
+                content = data.get("message", {}).get("content", "")
+            else:
+                content = self._extract_cleanup_text(data)
+            if not str(content).strip():
+                self._cleanup_debug("response parsing produced empty content; falling back to original text")
+            result = self._postprocess(str(content).strip()) or text
+        except requests.HTTPError as e:
+            status = getattr(e.response, "status_code", "unknown")
+            body = ""
+            with contextlib.suppress(Exception):
+                body = (e.response.text or "").strip()
+            if body:
+                self._cleanup_debug(f"http error status={status} body={body[:300]!r}")
+            else:
+                self._cleanup_debug(f"http error status={status}")
+            result = text
+        except Exception as e:
+            self._cleanup_debug(f"request failed: {e!r}")
+            result = text
+        self._remember_cleanup_exchange(text, result, system_prompt)
+        return result
 
     def output(self, text: str) -> None:
         self._output.output(text)
+
+    def submit(self) -> None:
+        self._output.submit()
+
+    def active_target_desc(self) -> str:
+        return self._output.active_target_desc()
+
+    @staticmethod
+    def _extract_cleanup_text(data: object) -> str:
+        if not isinstance(data, dict):
+            return ""
+        # Handle common chat API response shapes.
+        for key in ("output", "text", "response", "content"):
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        # Handle array-style output: {"output": [{"type":"message","content":"..."}]}
+        out = data.get("output")
+        if isinstance(out, list):
+            for item in out:
+                if isinstance(item, dict):
+                    value = item.get("content")
+                    if isinstance(value, str) and value.strip():
+                        return value
+        message = data.get("message")
+        if isinstance(message, dict):
+            value = message.get("content")
+            if isinstance(value, str) and value.strip():
+                return value
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                msg = first.get("message")
+                if isinstance(msg, dict):
+                    value = msg.get("content")
+                    if isinstance(value, str) and value.strip():
+                        return value
+                value = first.get("text")
+                if isinstance(value, str) and value.strip():
+                    return value
+        return ""
+
+    def _cleanup_debug(self, msg: str) -> None:
+        if self.cfg.debug:
+            print(f"[debug {time.strftime('%H:%M:%S')}] cleanup: {msg}", flush=True)
+
+    def _remember_cleanup_exchange(self, raw_input: str, final_output: str, system_prompt: str) -> None:
+        self._cleanup_input_history.append(raw_input)
+        self._cleanup_output_history.append(final_output)
+        self._cleanup_prompt_history.append(system_prompt)
+
+    def _resolve_cleanup_prompt(self, target_desc: str) -> str:
+        target = (target_desc or "").lower()
+        selected_prompt: str | None = None
+        selected_pattern: str | None = None
+        for pattern, prompt in self._cleanup_prompt_rules:
+            if pattern in target:
+                selected_pattern = pattern
+                selected_prompt = prompt
+        if selected_prompt is not None:
+            self._cleanup_debug(
+                f"prompt selected pattern={selected_pattern!r} target={target_desc!r}"
+            )
+            return selected_prompt
+        if self._cleanup_prompt_rules:
+            self._cleanup_debug(f"prompt no-match target={target_desc!r}; using default cleanup prompt")
+        return self._default_cleanup_prompt or DEFAULT_CLEANUP_PROMPT
 
     @staticmethod
     def _looks_clean(text: str) -> bool:
@@ -730,11 +1049,131 @@ def _active_sink_monitor_source() -> str | None:
     return f"{sink_name}.monitor"
 
 
-def _resume_media_playback() -> None:
-    # Best-effort resume for Linux desktops where PTT/mic profile switches can pause playback.
+def _list_player_names() -> list[str]:
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "-l"],
+            text=True,
+            timeout=1,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for line in out.splitlines():
+        name = line.strip()
+        if not name or name in seen:
+            continue
+        names.append(name)
+        seen.add(name)
+    return names
+
+
+def _player_status(name: str) -> str:
+    try:
+        out = subprocess.check_output(
+            ["playerctl", "-p", name, "status"],
+            text=True,
+            timeout=1,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return out.lower()
+    except Exception:
+        return ""
+
+
+def _players_with_status(status: str) -> list[str]:
+    target = status.lower()
+    return [name for name in _list_player_names() if _player_status(name) == target]
+
+
+def _pause_players(players: list[str]) -> list[str]:
+    paused: list[str] = []
+    for name in players:
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["playerctl", "-p", name, "pause"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+        if _player_status(name) == "paused":
+            paused.append(name)
+    return paused
+
+
+def _resume_players_if_paused(players: list[str]) -> list[str]:
+    resumed: list[str] = []
+    for name in players:
+        if _player_status(name) != "paused":
+            continue
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["playerctl", "-p", name, "play"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=False,
+            )
+        if _player_status(name) == "playing":
+            resumed.append(name)
+    return resumed
+
+
+def _list_non_monitor_sinks() -> list[str]:
+    try:
+        out = subprocess.check_output(
+            ["pactl", "list", "short", "sinks"],
+            text=True,
+            timeout=2,
+        )
+    except Exception:
+        return []
+    sinks: list[str] = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip()
+        if not name or ".monitor" in name:
+            continue
+        sinks.append(name)
+    return sinks
+
+
+def _duck_targets(scope: str) -> list[str]:
+    if scope == "all":
+        sinks = _list_non_monitor_sinks()
+        if sinks:
+            return sinks
+    return ["@DEFAULT_AUDIO_SINK@"]
+
+
+def _get_sink_volume(target: str) -> tuple[float, bool] | None:
+    try:
+        out = subprocess.check_output(
+            ["wpctl", "get-volume", target],
+            text=True,
+            timeout=1,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return None
+    match = re.search(r"([0-9]*\.?[0-9]+)", out)
+    if not match:
+        return None
+    volume = float(match.group(1))
+    muted = "[muted]" in out.lower()
+    return volume, muted
+
+
+def _set_sink_volume(target: str, volume: float) -> None:
+    vol = min(1.0, max(0.0, volume))
     with contextlib.suppress(Exception):
         subprocess.run(
-            ["playerctl", "play"],
+            ["wpctl", "set-volume", target, f"{vol:.6f}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=1,
@@ -742,17 +1181,40 @@ def _resume_media_playback() -> None:
         )
 
 
-def _media_was_playing() -> bool:
-    # Best-effort probe of current playback state.
+def _set_sink_muted(target: str, muted: bool) -> None:
     with contextlib.suppress(Exception):
+        subprocess.run(
+            ["wpctl", "set-mute", target, "1" if muted else "0"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+
+
+def _sink_debug_desc(target: str) -> str:
+    try:
         out = subprocess.check_output(
-            ["playerctl", "status"],
+            ["wpctl", "inspect", target],
             text=True,
             timeout=1,
             stderr=subprocess.DEVNULL,
-        ).strip()
-        return out.lower() == "playing"
-    return False
+        )
+    except Exception:
+        return "unavailable"
+    node_id = ""
+    node_name = ""
+    node_desc = ""
+    for line in out.splitlines():
+        s = line.strip()
+        if not node_id and s.startswith("id "):
+            node_id = s
+        if 'node.name = "' in s and not node_name:
+            node_name = s
+        if 'node.description = "' in s and not node_desc:
+            node_desc = s
+    parts = [p for p in (node_id, node_name, node_desc) if p]
+    return " | ".join(parts) if parts else out.splitlines()[0].strip() if out.strip() else "unavailable"
 
 
 def main() -> int:
@@ -761,10 +1223,17 @@ def main() -> int:
         return 0
 
     cfg = Config()
+    if cfg.cleanup_backend in {"generic_v1", "api_v1", "lm_api_v1"}:
+        parsed = urlparse(cfg.cleanup_url)
+        if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+            cfg.cleanup_url = cfg.cleanup_url.rstrip("/") + "/v1/chat"
+    if cfg.ptt_duck_scope not in {"default", "all"}:
+        cfg.ptt_duck_scope = "default"
     if cfg.paste_mode not in {"clipboard", "type", "primary"}:
         cfg.paste_mode = "clipboard"
     if not cfg.stt_compute_type:
         cfg.stt_compute_type = "float16" if cfg.stt_device in {"auto", "cuda"} else "int8"
+    cfg.ptt_duck_media_percent = max(0, min(100, int(cfg.ptt_duck_media_percent)))
     file_log_lock = threading.Lock()
     file_log_path = f"{datetime.now().strftime('%Y%m%d')}.log"
 
@@ -851,12 +1320,13 @@ def main() -> int:
     recorder = Recorder(cfg)
     pipeline = Pipeline(cfg)
     ptt_key = resolve_ptt_key(cfg.ptt_key)
-    work_q: queue.Queue[np.ndarray] = queue.Queue()
+    work_q: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
     stop_event = threading.Event()
 
     print(
         f"platform={platform.system().lower()} mode={cfg.mode} "
-        f"ptt={cfg.ptt_key} stt={cfg.stt_model} cleanup_model={cfg.ollama_model or 'disabled'} "
+        f"ptt={cfg.ptt_key} stt={cfg.stt_model} cleanup_backend={cfg.cleanup_backend} "
+        f"cleanup_model={cfg.cleanup_model or 'disabled'} "
         f"paste={cfg.paste} paste_mode={cfg.paste_mode}"
     , flush=True)
     dlog(f"sample_rate={cfg.sample_rate} stt_device={cfg.stt_device} stt_compute={cfg.stt_compute_type}")
@@ -873,8 +1343,17 @@ def main() -> int:
     dlog(f"context_enabled={cfg.context_enabled} context_chars={cfg.context_chars}")
     dlog(f"context_reset_every={cfg.context_reset_every}")
     dlog(f"audio_context_s={cfg.audio_context_s} audio_context_pad_s={cfg.audio_context_pad_s}")
+    dlog(f"stt_tail_pad_s={cfg.stt_tail_pad_s}")
     dlog(f"trim_chunk_terminal_period={cfg.trim_chunk_terminal_period}")
-    dlog(f"ptt_auto_resume_media={cfg.ptt_auto_resume_media}")
+    dlog(f"ptt_auto_pause_media={cfg.ptt_auto_pause_media}")
+    dlog(
+        f"ptt_duck_media={cfg.ptt_duck_media} "
+        f"ptt_duck_scope={cfg.ptt_duck_scope} "
+        f"ptt_duck_media_percent={cfg.ptt_duck_media_percent}"
+    )
+    dlog(f"ptt_auto_submit={cfg.ptt_auto_submit}")
+    if cfg.ptt_auto_pause_media and cfg.ptt_duck_media:
+        dlog("ptt media control: duck is enabled, so auto-pause is suppressed")
     dlog(
         "loop_guard="
         f"{cfg.loop_guard_enabled} "
@@ -896,7 +1375,8 @@ def main() -> int:
                 f"mode={cfg.mode}",
                 f"device={cfg.device_id}",
                 f"stt_model={cfg.stt_model}",
-                f"cleanup_model={cfg.ollama_model or 'disabled'}",
+                f"cleanup_backend={cfg.cleanup_backend}",
+                f"cleanup_model={cfg.cleanup_model or 'disabled'}",
                 f"paste={cfg.paste}",
             ]
         ),
@@ -908,7 +1388,7 @@ def main() -> int:
         ok_since_reset = 0
         while not stop_event.is_set():
             try:
-                audio = work_q.get(timeout=0.5)
+                audio, submit_after = work_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             chunk_no += 1
@@ -962,16 +1442,22 @@ def main() -> int:
             bad_streak = 0
             dlog(f"chunk#{chunk_no}: raw_text={text!r}")
             t1 = time.time()
-            flog("MODEL_CALL", f"n={chunk_no} model=cleanup enabled={cfg.cleanup and bool(cfg.ollama_model)}")
-            final = pipeline.cleanup(text)
+            cleanup_enabled = cfg.cleanup and (cfg.cleanup_backend != "ollama" or bool(cfg.cleanup_model))
+            flog("MODEL_CALL", f"n={chunk_no} model=cleanup backend={cfg.cleanup_backend} enabled={cleanup_enabled}")
+            target_desc = pipeline.active_target_desc()
+            final = pipeline.cleanup(text, target_desc=target_desc)
             dlog(f"chunk#{chunk_no}: cleanup_ms={(time.time()-t1)*1000:.0f}")
             flog("MODEL_RESULT", f"n={chunk_no} model=cleanup ms={(time.time()-t1)*1000:.0f} text={final!r}")
             if final:
                 pipeline.output(final)
+                if submit_after:
+                    pipeline.submit()
                 clear_ptt_indicator()
                 sys.stdout.write(final + " ")
                 sys.stdout.flush()
                 flog("OUTPUT", f"n={chunk_no} text={final!r}")
+                if submit_after:
+                    flog("OUTPUT", f"n={chunk_no} action=auto_submit")
                 ok_since_reset += 1
                 if cfg.context_reset_every > 0 and ok_since_reset >= cfg.context_reset_every:
                     dlog(f"chunk#{chunk_no}: periodic context reset after {ok_since_reset} chunks")
@@ -986,41 +1472,98 @@ def main() -> int:
     t.start()
 
     held = False
-    media_was_playing_on_press = False
+    shift_held = False
+    ducked_sink_states: dict[str, tuple[float, bool]] = {}
+    players_playing_on_press: list[str] = []
+    players_paused_by_app: list[str] = []
+
+    def _is_shift_key(k: keyboard.Key | keyboard.KeyCode | None) -> bool:
+        return k in {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
 
     def on_press(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held, media_was_playing_on_press
+        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app
         if cfg.debug and cfg.debug_keys:
             dlog(f"key press: {k!r} matches_ptt={k == ptt_key}")
+        if _is_shift_key(k):
+            shift_held = True
         if k == ptt_key and not held:
             held = True
-            if cfg.mode == "ptt" and cfg.ptt_auto_resume_media and platform.system() == "Linux":
-                media_was_playing_on_press = _media_was_playing()
-                dlog(f"ptt press: media_was_playing={media_was_playing_on_press}")
             try:
                 recorder.start()
                 show_ptt_indicator()
+                if cfg.mode == "ptt" and platform.system() == "Linux":
+                    players_playing_on_press = _players_with_status("playing")
+                    players_paused_by_app = []
+                    if cfg.ptt_duck_media:
+                        ducked_sink_states = {}
+                        targets = _duck_targets(cfg.ptt_duck_scope)
+                        dlog(f"ptt press: duck scope={cfg.ptt_duck_scope} targets={targets}")
+                        for target in targets:
+                            state = _get_sink_volume(target)
+                            if state is None:
+                                dlog(f"ptt press: unable to query sink volume target={target!r}")
+                                continue
+                            ducked_sink_states[target] = state
+                            sink_desc = _sink_debug_desc(target)
+                            dlog(f"ptt press: duck target sink={target!r} desc={sink_desc}")
+                            dlog(
+                                f"ptt press: sink volume before duck target={target!r} "
+                                f"vol={state[0]:.3f} muted={state[1]}"
+                            )
+                            _set_sink_volume(target, cfg.ptt_duck_media_percent / 100.0)
+                            post = _get_sink_volume(target)
+                            if post is not None:
+                                dlog(
+                                    f"ptt press: sink volume after duck target={target!r} "
+                                    f"vol={post[0]:.3f} muted={post[1]}"
+                                )
+                        if ducked_sink_states:
+                            dlog(f"ptt press: ducked {len(ducked_sink_states)} sink(s)")
+                        else:
+                            dlog("ptt press: no sink states captured for ducking")
+                    elif cfg.ptt_auto_pause_media:
+                        players_paused_by_app = _pause_players(players_playing_on_press)
+                        dlog(
+                            "ptt press: paused players="
+                            f"{players_paused_by_app} (from playing={players_playing_on_press})"
+                        )
                 dlog("ptt pressed: recording started")
             except Exception as e:
                 held = False
                 print(f"record start failed: {e}")
 
     def on_release(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held, media_was_playing_on_press
+        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app
         if cfg.debug and cfg.debug_keys:
             dlog(f"key release: {k!r} matches_ptt={k == ptt_key}")
+        if _is_shift_key(k):
+            shift_held = False
         if k == ptt_key and held:
             held = False
             audio = recorder.stop()
-            work_q.put(audio)
+            submit_after = cfg.mode == "ptt" and cfg.ptt_auto_submit and not shift_held
+            work_q.put((audio, submit_after))
             dlog("ptt released: queued audio chunk")
-            if cfg.mode == "ptt" and cfg.ptt_auto_resume_media and platform.system() == "Linux":
-                if media_was_playing_on_press:
-                    _resume_media_playback()
-                    dlog("ptt release: requested media resume via playerctl")
-                else:
-                    dlog("ptt release: media was not playing on press, skip resume")
-                media_was_playing_on_press = False
+            if cfg.mode == "ptt" and platform.system() == "Linux":
+                if cfg.ptt_duck_media and ducked_sink_states:
+                    for target, (prior_volume, prior_muted) in ducked_sink_states.items():
+                        sink_desc = _sink_debug_desc(target)
+                        dlog(f"ptt release: restore target sink={target!r} desc={sink_desc}")
+                        _set_sink_volume(target, prior_volume)
+                        _set_sink_muted(target, prior_muted)
+                        post = _get_sink_volume(target)
+                        if post is not None:
+                            dlog(
+                                f"ptt release: sink volume after restore target={target!r} "
+                                f"vol={post[0]:.3f} muted={post[1]}"
+                            )
+                    dlog(f"ptt release: restored {len(ducked_sink_states)} sink(s)")
+                    ducked_sink_states = {}
+                resume_targets = players_paused_by_app or players_playing_on_press
+                resumed = _resume_players_if_paused(resume_targets)
+                dlog(f"ptt release: resumed players={resumed} from targets={resume_targets}")
+                players_playing_on_press = []
+                players_paused_by_app = []
 
     if cfg.mode == "ptt":
         print(
@@ -1053,7 +1596,7 @@ def main() -> int:
             while True:
                 time.sleep(max(1, cfg.loopback_chunk_s))
                 audio = recorder.take_chunk()
-                work_q.put(audio)
+                work_q.put((audio, False))
                 dlog(f"queued chunk samples={audio.size}")
         except KeyboardInterrupt:
             pass
