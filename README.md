@@ -39,6 +39,9 @@ dictate-min --list-input-devices
 - `DICTATE_DEBUG`: `1` for verbose runtime diagnostics (default `0`)
 - `DICTATE_DEBUG_KEYS`: `1` to log every key press/release and whether it matches PTT (default `0`)
 - `DICTATE_FILE_LOG`: `1` to append runtime/model/output events to `YYYYMMDD.log` (default `1`)
+- `DICTATE_RUNTIME_ENV_FILE`: optional path to a runtime `.env` overrides file polled while running for hot updates (default disabled)
+  - hot-reloadable: debug flags, most cleanup settings, `DICTATE_PTT_AUTO_PAUSE_MEDIA`, ducking settings, `DICTATE_PTT_AUTO_SUBMIT`, `DICTATE_CONTEXT_RESET_EVERY`, `DICTATE_TRIM_CHUNK_PERIOD`, `DICTATE_LOOP_GUARD`
+  - restart-required: mode/device/STT engine settings, paste transport settings, and most audio pipeline geometry settings
 
 ### Push-to-talk mode
 - `DICTATE_PTT_KEY`: `cmd_r`, `super_r`, `cmd_l`, `super_l`, `super`, `win`, `shift_r`, `shift_l`, `ctrl_l`, `ctrl_r`, `alt_l`, `alt_r` (default `ctrl_r`)

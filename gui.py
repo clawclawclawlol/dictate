@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import queue
+import subprocess
+import threading
+from dataclasses import dataclass
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlparse
+
+import requests
+
+
+@dataclass(frozen=True)
+class FieldSpec:
+    name: str
+    label: str
+    kind: str  # bool | str | int | float | enum | combo
+    default: str
+    section: str
+    choices: tuple[str, ...] = ()
+    width: int = 38
+
+
+FIELD_SPECS: list[FieldSpec] = [
+    FieldSpec("DICTATE_MODE", "Mode", "enum", "ptt", "General", ("ptt", "loopback")),
+    FieldSpec("DICTATE_PTT_KEY", "PTT Key", "enum", "ctrl_r", "General", ("cmd_r", "super_r", "cmd_l", "super_l", "super", "win", "shift_r", "shift_l", "ctrl_l", "ctrl_r", "alt_l", "alt_r")),
+    FieldSpec("DICTATE_INPUT_DEVICE", "Input Device ID", "combo", "", "General"),
+    FieldSpec("DICTATE_INPUT_DEVICE_NAME", "Input Device Name", "combo", "", "General"),
+    FieldSpec("DICTATE_INPUT_LANGUAGE", "Input Language", "str", "auto", "General"),
+    FieldSpec("DICTATE_SAMPLE_RATE", "Sample Rate", "int", "16000", "General"),
+    FieldSpec("DICTATE_DEBUG", "Debug", "bool", "0", "General"),
+    FieldSpec("DICTATE_DEBUG_KEYS", "Debug Keys", "bool", "0", "General"),
+    FieldSpec("DICTATE_FILE_LOG", "File Log", "bool", "1", "General"),
+
+    FieldSpec("DICTATE_PASTE", "Paste Output", "bool", "1", "Output"),
+    FieldSpec("DICTATE_PASTE_MODE", "Paste Mode", "enum", "type", "Output", ("clipboard", "type", "primary")),
+    FieldSpec("DICTATE_PASTE_PRIMARY_CLICK", "Primary Click Paste", "bool", "1", "Output"),
+    FieldSpec("DICTATE_PASTE_PRESERVE", "Preserve Clipboard", "bool", "1", "Output"),
+    FieldSpec("DICTATE_PASTE_RESTORE_DELAY_MS", "Restore Delay (ms)", "int", "80", "Output"),
+
+    FieldSpec("DICTATE_PTT_AUTO_PAUSE_MEDIA", "Auto Pause Media", "bool", "1", "PTT Media"),
+    FieldSpec("DICTATE_PTT_DUCK_MEDIA", "Duck Media", "bool", "0", "PTT Media"),
+    FieldSpec("DICTATE_PTT_DUCK_SCOPE", "Duck Scope", "enum", "default", "PTT Media", ("default", "all")),
+    FieldSpec("DICTATE_PTT_DUCK_MEDIA_PERCENT", "Duck Percent", "int", "30", "PTT Media"),
+    FieldSpec("DICTATE_PTT_AUTO_SUBMIT", "Auto Submit", "bool", "0", "PTT Media"),
+
+    FieldSpec("DICTATE_LOOPBACK_CHUNK_S", "Loopback Chunk Seconds", "int", "4", "Loopback"),
+    FieldSpec("DICTATE_LOOPBACK_HINT", "Loopback Hint", "str", "loopback pcm", "Loopback"),
+    FieldSpec("DICTATE_PULSE_SOURCE", "Pulse Source", "str", "", "Loopback"),
+    FieldSpec("DICTATE_MIN_CHUNK_RMS", "Min Chunk RMS", "float", "0.0008", "Loopback"),
+
+    FieldSpec(
+        "DICTATE_STT_MODEL",
+        "STT Model",
+        "combo",
+        "medium.en",
+        "Whisper",
+        ("tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v2", "large-v3", "large"),
+    ),
+    FieldSpec("DICTATE_STT_DEVICE", "STT Device", "enum", "auto", "Whisper", ("cpu", "auto", "cuda")),
+    FieldSpec("DICTATE_STT_COMPUTE", "STT Compute", "str", "", "Whisper"),
+    FieldSpec("DICTATE_STT_CONDITION_PREV", "Condition on Previous", "bool", "0", "Whisper"),
+    FieldSpec("DICTATE_STT_BEAM_SIZE", "Beam Size", "int", "5", "Whisper"),
+    FieldSpec("DICTATE_STT_NO_SPEECH_THRESHOLD", "No-Speech Threshold", "float", "0.6", "Whisper"),
+    FieldSpec("DICTATE_STT_LOGPROB_THRESHOLD", "Logprob Threshold", "float", "-1.0", "Whisper"),
+    FieldSpec("DICTATE_STT_COMPRESSION_RATIO_THRESHOLD", "Compression Ratio Threshold", "float", "2.4", "Whisper"),
+    FieldSpec("DICTATE_STT_TAIL_PAD_S", "Tail Pad Seconds", "float", "0.08", "Whisper"),
+
+    FieldSpec("DICTATE_CONTEXT", "Context Enabled", "bool", "1", "Context"),
+    FieldSpec("DICTATE_CONTEXT_CHARS", "Context Chars", "int", "600", "Context"),
+    FieldSpec("DICTATE_CONTEXT_RESET_EVERY", "Context Reset Every", "int", "1", "Context"),
+    FieldSpec("DICTATE_AUDIO_CONTEXT_S", "Audio Context Seconds", "float", "1.6", "Context"),
+    FieldSpec("DICTATE_AUDIO_CONTEXT_PAD_S", "Audio Context Pad", "float", "0.12", "Context"),
+    FieldSpec("DICTATE_TRIM_CHUNK_PERIOD", "Trim Chunk Period", "bool", "1", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD", "Loop Guard", "bool", "1", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD_REPEAT_RATIO", "Loop Repeat Ratio", "float", "0.55", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD_PUNCT_RATIO", "Loop Punct Ratio", "float", "0.35", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD_SHORT_RUN", "Loop Short Run", "int", "4", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD_SHORT_LEN", "Loop Short Len", "int", "3", "Context"),
+
+    FieldSpec("DICTATE_CLEANUP", "Cleanup Enabled", "bool", "1", "Cleanup"),
+    FieldSpec("DICTATE_CLEANUP_BACKEND", "Cleanup Backend", "enum", "ollama", "Cleanup", ("ollama", "generic_v1", "api_v1", "lm_api_v1")),
+    FieldSpec("DICTATE_CLEANUP_URL", "Cleanup URL", "str", "http://localhost:11434/api/chat", "Cleanup", width=52),
+    FieldSpec("DICTATE_CLEANUP_MODEL", "Cleanup Model", "combo", "", "Cleanup", width=52),
+    FieldSpec("DICTATE_CLEANUP_API_TOKEN", "Cleanup API Token", "str", "", "Cleanup", width=52),
+    FieldSpec("LM_API_TOKEN", "LM API Token", "str", "", "Cleanup", width=52),
+    FieldSpec("DICTATE_CLEANUP_PROMPT", "Cleanup Prompt", "str", "You are a dictation post-processor. Fix punctuation and capitalization only. Do not add ideas. Output only corrected text.", "Cleanup", width=70),
+    FieldSpec("DICTATE_CLEANUP_PROMPTS", "Cleanup Prompt Rules", "str", "", "Cleanup", width=70),
+    FieldSpec("DICTATE_CLEANUP_REASONING", "Cleanup Reasoning", "str", "off", "Cleanup"),
+    FieldSpec("DICTATE_CLEANUP_TEMPERATURE", "Cleanup Temperature", "float", "0.2", "Cleanup"),
+    FieldSpec("DICTATE_CLEANUP_HISTORY_SIZE", "Cleanup History Size", "int", "12", "Cleanup"),
+]
+
+RESTART_REQUIRED_ENV: set[str] = {
+    "DICTATE_MODE",
+    "DICTATE_INPUT_DEVICE",
+    "DICTATE_INPUT_DEVICE_NAME",
+    "DICTATE_SAMPLE_RATE",
+    "DICTATE_PTT_KEY",
+    "DICTATE_STT_MODEL",
+    "DICTATE_STT_DEVICE",
+    "DICTATE_STT_COMPUTE",
+    "DICTATE_STT_CONDITION_PREV",
+    "DICTATE_STT_BEAM_SIZE",
+    "DICTATE_STT_NO_SPEECH_THRESHOLD",
+    "DICTATE_STT_LOGPROB_THRESHOLD",
+    "DICTATE_STT_COMPRESSION_RATIO_THRESHOLD",
+    "DICTATE_STT_TAIL_PAD_S",
+    "DICTATE_INPUT_LANGUAGE",
+    "DICTATE_LOOPBACK_CHUNK_S",
+    "DICTATE_LOOPBACK_HINT",
+    "DICTATE_PULSE_SOURCE",
+    "DICTATE_MIN_CHUNK_RMS",
+    "DICTATE_CONTEXT",
+    "DICTATE_CONTEXT_CHARS",
+    "DICTATE_AUDIO_CONTEXT_S",
+    "DICTATE_AUDIO_CONTEXT_PAD_S",
+    "DICTATE_LOOP_GUARD_REPEAT_RATIO",
+    "DICTATE_LOOP_GUARD_PUNCT_RATIO",
+    "DICTATE_LOOP_GUARD_SHORT_RUN",
+    "DICTATE_LOOP_GUARD_SHORT_LEN",
+    "DICTATE_PASTE",
+    "DICTATE_PASTE_MODE",
+    "DICTATE_PASTE_PRIMARY_CLICK",
+    "DICTATE_PASTE_PRESERVE",
+    "DICTATE_PASTE_RESTORE_DELAY_MS",
+}
+
+PRESETS: dict[str, dict[str, str]] = {
+    "Default": {},
+    "Terminal Dictation": {
+        "DICTATE_MODE": "ptt",
+        "DICTATE_PASTE": "1",
+        "DICTATE_PASTE_MODE": "type",
+        "DICTATE_PTT_DUCK_MEDIA": "1",
+        "DICTATE_PTT_DUCK_SCOPE": "default",
+        "DICTATE_CLEANUP_BACKEND": "generic_v1",
+        "DICTATE_CLEANUP_REASONING": "off",
+        "DICTATE_CLEANUP_TEMPERATURE": "0.2",
+        "DICTATE_CLEANUP_PROMPTS": "/terminal/Output only shell-safe plain text commands. No markdown.",
+    },
+    "Low Latency": {
+        "DICTATE_STT_MODEL": "tiny",
+        "DICTATE_STT_BEAM_SIZE": "1",
+        "DICTATE_CLEANUP": "0",
+        "DICTATE_CONTEXT_RESET_EVERY": "1",
+    },
+}
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    if not path.exists():
+        return data
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        data[k.strip()] = v.strip()
+    return data
+
+
+def write_env_file(path: Path, values: dict[str, str]) -> None:
+    lines = [f"{k}={v}" for k, v in sorted(values.items())]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent: tk.Widget) -> None:
+        super().__init__(parent)
+        canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0)
+        vscroll = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+
+        self.inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.configure(yscrollcommand=vscroll.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        vscroll.pack(side="right", fill="y")
+
+
+class DictateGui(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Dictate Config")
+        self.geometry("1180x820")
+        self.minsize(980, 700)
+
+        self._proc: subprocess.Popen[str] | None = None
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        self._vars: dict[str, tk.Variable] = {}
+        self._widgets: dict[str, tk.Widget] = {}
+        self._spec_by_name = {s.name: s for s in FIELD_SPECS}
+        self._env_path = tk.StringVar(value=str(Path.cwd() / ".env"))
+        self._runtime_overrides_path = Path.cwd() / ".dictate-runtime.env"
+        self._preset = tk.StringVar(value="Default")
+        self._auto_restart = tk.BooleanVar(value=True)
+        self._suspend_auto_apply = True
+        self._pending_changed_keys: set[str] = set()
+        self._pending_apply_after_id: str | None = None
+        self._input_devices: list[tuple[str, str]] = []
+
+        self._setup_style()
+        self._build_ui()
+        self._reset_to_defaults()
+        self._suspend_auto_apply = False
+        self._refresh_input_devices()
+        self.after(80, self._drain_log)
+
+    def _setup_style(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        base_font = ("Segoe UI", 10)
+        self.option_add("*Font", base_font)
+        style.configure("TFrame", background="#f5f7fb")
+        style.configure("TLabelframe", background="#f5f7fb")
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10), foreground="#1b2230")
+        style.configure("TLabel", background="#f5f7fb", foreground="#1b2230")
+        style.configure("Header.TLabel", font=("Segoe UI Semibold", 14), foreground="#0f172a")
+        style.configure("Sub.TLabel", foreground="#475569")
+        style.configure("Warn.TLabel", foreground="#b45309")
+        style.configure("TButton", padding=(10, 6))
+        style.configure("Accent.TButton", padding=(10, 6), foreground="#ffffff", background="#0b5fff")
+
+    def _build_ui(self) -> None:
+        root = ttk.Frame(self, padding=16)
+        root.pack(fill="both", expand=True)
+
+        top = ttk.Frame(root)
+        top.pack(fill="x")
+        ttk.Label(top, text="Dictate Desktop Config", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(top, text="Edit environment settings, save to .env, and launch dictate-min.", style="Sub.TLabel").pack(anchor="w", pady=(2, 10))
+
+        controls = ttk.Frame(root)
+        controls.pack(fill="x", pady=(0, 10))
+        ttk.Label(controls, text="Env File").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Entry(controls, textvariable=self._env_path, width=70).grid(row=0, column=1, sticky="ew")
+        ttk.Button(controls, text="Browse", command=self._browse_env).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(controls, text="Load", command=self._load_env).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(controls, text="Save", command=self._save_env).grid(row=0, column=4, padx=(8, 0))
+
+        ttk.Label(controls, text="Preset").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
+        preset_box = ttk.Combobox(controls, textvariable=self._preset, values=list(PRESETS), state="readonly", width=28)
+        preset_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Button(controls, text="Apply Preset", command=self._apply_preset).grid(row=1, column=2, pady=(8, 0), padx=(8, 0))
+        ttk.Button(controls, text="Reset Defaults", command=self._reset_to_defaults).grid(row=1, column=3, pady=(8, 0), padx=(8, 0))
+
+        ttk.Button(controls, text="Start dictate-min", style="Accent.TButton", command=self._start).grid(row=1, column=4, pady=(8, 0), padx=(8, 0))
+        ttk.Button(controls, text="Apply Live", command=self._apply_live).grid(row=1, column=5, pady=(8, 0), padx=(8, 0))
+        ttk.Button(controls, text="Stop", command=self._stop).grid(row=1, column=6, pady=(8, 0), padx=(8, 0))
+        ttk.Button(controls, text="Refresh Models", command=self._refresh_model_choices).grid(row=1, column=7, pady=(8, 0), padx=(8, 0))
+        ttk.Checkbutton(controls, text="Auto Restart", variable=self._auto_restart).grid(row=1, column=8, pady=(8, 0), padx=(12, 0), sticky="w")
+        ttk.Button(controls, text="Refresh Input Devices", command=self._refresh_input_devices).grid(row=1, column=9, pady=(8, 0), padx=(8, 0))
+
+        controls.columnconfigure(1, weight=1)
+
+        body = ttk.Panedwindow(root, orient="vertical")
+        body.pack(fill="both", expand=True)
+
+        notebook = ttk.Notebook(body)
+        body.add(notebook, weight=5)
+
+        sections = sorted({s.section for s in FIELD_SPECS})
+        for section in sections:
+            tab = ScrollableFrame(notebook)
+            notebook.add(tab, text=section)
+            self._render_section(tab.inner, section)
+
+        log_frame = ttk.Labelframe(body, text="Runtime Log", padding=8)
+        body.add(log_frame, weight=2)
+        self._log = tk.Text(log_frame, height=12, wrap="word", bg="#0b1220", fg="#d1d9e6", insertbackground="#d1d9e6")
+        self._log.pack(fill="both", expand=True)
+
+    def _render_section(self, parent: ttk.Frame, section: str) -> None:
+        row = 0
+        for spec in [s for s in FIELD_SPECS if s.section == section]:
+            ttk.Label(parent, text=spec.label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
+            if spec.kind == "bool":
+                var = tk.BooleanVar(value=(spec.default == "1"))
+                w = ttk.Checkbutton(parent, variable=var)
+                w.grid(row=row, column=1, sticky="w", pady=6)
+            elif spec.kind == "enum":
+                var = tk.StringVar(value=spec.default)
+                w = ttk.Combobox(parent, textvariable=var, values=list(spec.choices), state="readonly", width=max(20, spec.width))
+                w.grid(row=row, column=1, sticky="ew", pady=6)
+            elif spec.kind == "combo":
+                var = tk.StringVar(value=spec.default)
+                w = ttk.Combobox(parent, textvariable=var, values=list(spec.choices), state="normal", width=max(20, spec.width))
+                w.grid(row=row, column=1, sticky="ew", pady=6)
+            else:
+                var = tk.StringVar(value=spec.default)
+                show = "*" if "TOKEN" in spec.name else ""
+                w = ttk.Entry(parent, textvariable=var, width=spec.width, show=show)
+                w.grid(row=row, column=1, sticky="ew", pady=6)
+            ttk.Label(parent, text=spec.name, style="Sub.TLabel").grid(row=row, column=2, sticky="w", padx=(10, 0), pady=6)
+            if spec.name in RESTART_REQUIRED_ENV:
+                ttk.Label(parent, text="restart", style="Warn.TLabel").grid(row=row, column=3, sticky="w", padx=(8, 0), pady=6)
+            self._vars[spec.name] = var
+            self._widgets[spec.name] = w
+            var.trace_add("write", lambda *_args, key=spec.name: self._on_var_changed(key))
+            row += 1
+        parent.columnconfigure(1, weight=1)
+
+    def _browse_env(self) -> None:
+        p = filedialog.asksaveasfilename(title="Select .env", defaultextension=".env", initialfile=".env")
+        if p:
+            self._env_path.set(p)
+
+    def _apply_preset(self) -> None:
+        self._suspend_auto_apply = True
+        self._reset_to_defaults()
+        preset = PRESETS.get(self._preset.get(), {})
+        for key, value in preset.items():
+            self._set_var(key, value)
+        self._refresh_model_choices()
+        self._suspend_auto_apply = False
+        self._schedule_auto_apply(set(preset.keys()))
+
+    def _reset_to_defaults(self) -> None:
+        was_suspended = self._suspend_auto_apply
+        self._suspend_auto_apply = True
+        for spec in FIELD_SPECS:
+            self._set_var(spec.name, spec.default)
+        self._refresh_model_choices()
+        self._suspend_auto_apply = was_suspended
+
+    def _load_env(self) -> None:
+        path = Path(self._env_path.get())
+        data = parse_env_file(path)
+        self._suspend_auto_apply = True
+        for key, value in data.items():
+            if key in self._vars:
+                self._set_var(key, value)
+        self._refresh_model_choices()
+        self._suspend_auto_apply = False
+        self._schedule_auto_apply(set(data.keys()))
+        self._append_log(f"Loaded {len(data)} entries from {path}")
+
+    def _save_env(self) -> None:
+        path = Path(self._env_path.get())
+        values = self._env_values(include_empty=False)
+        write_env_file(path, values)
+        self._append_log(f"Saved {len(values)} entries to {path}")
+
+    def _env_values(self, include_empty: bool = False) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for spec in FIELD_SPECS:
+            v = self._var_as_string(spec.name)
+            if v or include_empty:
+                out[spec.name] = v
+        return out
+
+    def _set_var(self, name: str, value: str) -> None:
+        var = self._vars[name]
+        if isinstance(var, tk.BooleanVar):
+            var.set(str(value).strip().lower() in {"1", "true", "yes", "on"})
+        else:
+            var.set(str(value))
+
+    def _var_as_string(self, name: str) -> str:
+        spec = self._spec_by_name[name]
+        var = self._vars[name]
+        if spec.kind == "bool":
+            return "1" if bool(var.get()) else "0"
+        return str(var.get()).strip()
+
+    def _start(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            messagebox.showinfo("dictate-min", "Process is already running.")
+            return
+        env = os.environ.copy()
+        runtime_values = self._env_values(include_empty=False)
+        write_env_file(self._runtime_overrides_path, runtime_values)
+        env.update(runtime_values)
+        env["DICTATE_RUNTIME_ENV_FILE"] = str(self._runtime_overrides_path)
+        try:
+            self._proc = subprocess.Popen(
+                ["dictate-min"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+        except FileNotFoundError:
+            messagebox.showerror("dictate-min", "Command 'dictate-min' not found. Activate your venv and install package with pip -e .")
+            return
+        self._append_log(f"Started dictate-min (live overrides: {self._runtime_overrides_path})")
+        threading.Thread(target=self._pump_process_output, daemon=True).start()
+
+    def _apply_live(self, quiet: bool = False) -> bool:
+        if not self._proc or self._proc.poll() is not None:
+            if not quiet:
+                self._append_log("No running process. Start dictate-min first.")
+            return False
+        values = self._env_values(include_empty=False)
+        write_env_file(self._runtime_overrides_path, values)
+        if not quiet:
+            self._append_log(
+                f"Applied live update to {self._runtime_overrides_path} "
+                "(some settings still require restart)"
+            )
+        return True
+
+    def _stop(self) -> None:
+        if not self._proc or self._proc.poll() is not None:
+            self._append_log("No running process to stop.")
+            return
+        self._proc.terminate()
+        self._append_log("Sent terminate signal.")
+
+    def _restart_process(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=2)
+        self._proc = None
+        self._start()
+
+    def _pump_process_output(self) -> None:
+        assert self._proc is not None
+        proc = self._proc
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                self._log_queue.put(line.rstrip("\n"))
+        rc = proc.wait()
+        self._log_queue.put(f"[process exited rc={rc}]")
+
+    def _drain_log(self) -> None:
+        while True:
+            try:
+                line = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._append_log(line)
+        self.after(80, self._drain_log)
+
+    def _append_log(self, line: str) -> None:
+        self._log.insert("end", line + "\n")
+        self._log.see("end")
+
+    def _on_var_changed(self, key: str) -> None:
+        if self._suspend_auto_apply:
+            return
+        self._schedule_auto_apply({key})
+
+    def _schedule_auto_apply(self, keys: set[str]) -> None:
+        self._pending_changed_keys.update(keys)
+        if self._pending_apply_after_id is not None:
+            self.after_cancel(self._pending_apply_after_id)
+        self._pending_apply_after_id = self.after(450, self._flush_auto_apply)
+
+    def _flush_auto_apply(self) -> None:
+        self._pending_apply_after_id = None
+        changed = set(self._pending_changed_keys)
+        self._pending_changed_keys.clear()
+        if not changed:
+            return
+        if not self._proc or self._proc.poll() is not None:
+            return
+        needs_restart = bool(changed & RESTART_REQUIRED_ENV)
+        if needs_restart and self._auto_restart.get():
+            self._append_log(
+                f"Auto apply: restart required for {sorted(changed & RESTART_REQUIRED_ENV)}; restarting process."
+            )
+            self._restart_process()
+            return
+        applied = self._apply_live(quiet=True)
+        if applied:
+            if needs_restart:
+                self._append_log(
+                    f"Auto apply: updated live, but restart required for {sorted(changed & RESTART_REQUIRED_ENV)}"
+                )
+            else:
+                self._append_log(f"Auto apply: applied {sorted(changed)}")
+
+    @staticmethod
+    def _normalize_cleanup_url(backend: str, url: str) -> str:
+        out = (url or "").strip()
+        if backend in {"generic_v1", "api_v1", "lm_api_v1"}:
+            parsed = urlparse(out)
+            if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+                out = out.rstrip("/") + "/v1/chat"
+        return out
+
+    def _refresh_model_choices(self) -> None:
+        # STT models: keep built-in list.
+        stt_w = self._widgets.get("DICTATE_STT_MODEL")
+        stt_spec = self._spec_by_name["DICTATE_STT_MODEL"]
+        if isinstance(stt_w, ttk.Combobox):
+            stt_w["values"] = list(stt_spec.choices)
+
+        cleanup_w = self._widgets.get("DICTATE_CLEANUP_MODEL")
+        if not isinstance(cleanup_w, ttk.Combobox):
+            return
+        backend = self._var_as_string("DICTATE_CLEANUP_BACKEND").strip().lower()
+        url = self._normalize_cleanup_url(backend, self._var_as_string("DICTATE_CLEANUP_URL"))
+        token = self._var_as_string("LM_API_TOKEN") or self._var_as_string("DICTATE_CLEANUP_API_TOKEN")
+        headers: dict[str, str] = {}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        models: list[str] = []
+        try:
+            if backend == "ollama":
+                tags_url = url.rstrip("/")
+                if tags_url.endswith("/api/chat"):
+                    tags_url = tags_url[: -len("/api/chat")] + "/api/tags"
+                else:
+                    tags_url = tags_url + "/api/tags"
+                resp = requests.get(tags_url, headers=headers, timeout=3)
+                resp.raise_for_status()
+                data = resp.json()
+                models = [str(m.get("name", "")).strip() for m in data.get("models", []) if isinstance(m, dict)]
+            else:
+                base = url.rstrip("/")
+                candidates: list[str] = []
+                if base.endswith("/api/v1/chat"):
+                    root = base[: -len("/api/v1/chat")]
+                    candidates = [root + "/api/v1/models", root + "/v1/models"]
+                elif base.endswith("/v1/chat"):
+                    root = base[: -len("/v1/chat")]
+                    candidates = [root + "/v1/models", root + "/api/v1/models"]
+                else:
+                    candidates = [base + "/api/v1/models", base + "/v1/models"]
+                for endpoint in candidates:
+                    try:
+                        resp = requests.get(endpoint, headers=headers, timeout=3)
+                        resp.raise_for_status()
+                        data = resp.json()
+                    except Exception:
+                        continue
+                    if isinstance(data, dict):
+                        if isinstance(data.get("data"), list):
+                            for item in data["data"]:
+                                if isinstance(item, dict):
+                                    mid = str(item.get("id", "")).strip()
+                                    if mid:
+                                        models.append(mid)
+                        if isinstance(data.get("models"), list):
+                            for item in data["models"]:
+                                if isinstance(item, dict):
+                                    mtype = str(item.get("type", "")).strip().lower()
+                                    key = str(item.get("key", "")).strip()
+                                    if key and (not mtype or mtype == "llm"):
+                                        models.append(key)
+                    if models:
+                        break
+        except Exception as e:
+            self._append_log(f"Model refresh failed: {e!r}")
+
+        uniq = sorted({m for m in models if m})
+        cleanup_w["values"] = uniq
+        self._append_log(f"Loaded {len(uniq)} cleanup model(s) for backend={backend}")
+
+    def _refresh_input_devices(self) -> None:
+        id_widget = self._widgets.get("DICTATE_INPUT_DEVICE")
+        name_widget = self._widgets.get("DICTATE_INPUT_DEVICE_NAME")
+        if not isinstance(id_widget, ttk.Combobox) or not isinstance(name_widget, ttk.Combobox):
+            return
+        try:
+            proc = subprocess.run(
+                ["dictate-min", "--list-input-devices"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+                timeout=6,
+            )
+        except Exception as e:
+            self._append_log(f"Input device refresh failed: {e!r}")
+            return
+        devices: list[tuple[str, str]] = []
+        for line in proc.stdout.splitlines():
+            s = line.rstrip()
+            if not s.strip():
+                continue
+            parts = s.strip().split(maxsplit=1)
+            if not parts or not parts[0].isdigit():
+                continue
+            idx = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            devices.append((idx, name))
+        self._input_devices = devices
+        id_widget["values"] = [idx for idx, _ in devices]
+        name_widget["values"] = [name for _, name in devices]
+        self._append_log(f"Loaded {len(devices)} input device(s)")
+
+
+def main() -> int:
+    app = DictateGui()
+    app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

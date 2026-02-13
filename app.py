@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from pathlib import Path
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime
@@ -133,6 +134,30 @@ def render_cleanup_template(
 
         s = pat.sub(repl, s)
     return s
+
+
+def parse_env_overrides_file(path: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return out
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        key, value = s.split("=", 1)
+        out[key.strip()] = value.strip()
+    return out
+
+
+def normalize_cleanup_url(backend: str, url: str) -> str:
+    out = (url or "").strip()
+    if backend in {"generic_v1", "api_v1", "lm_api_v1"}:
+        parsed = urlparse(out)
+        if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
+            out = out.rstrip("/") + "/v1/chat"
+    return out
 
 
 @dataclass
@@ -645,14 +670,23 @@ class Pipeline:
         self.cfg = cfg
         self._stt = SttEngine(cfg)
         self._output = OutputSink(cfg)
+        self._default_cleanup_prompt = self.cfg.cleanup_prompt or DEFAULT_CLEANUP_PROMPT
+        self._cleanup_prompt_rules: list[tuple[str, str]] = []
+        self._cleanup_input_history: deque[str] = deque(maxlen=max(1, int(self.cfg.cleanup_history_size)))
+        self._cleanup_output_history: deque[str] = deque(maxlen=max(1, int(self.cfg.cleanup_history_size)))
+        self._cleanup_prompt_history: deque[str] = deque(maxlen=max(1, int(self.cfg.cleanup_history_size)))
+        self.refresh_cleanup_runtime_config()
+
+    def refresh_cleanup_runtime_config(self) -> None:
         self._default_cleanup_prompt, self._cleanup_prompt_rules = parse_cleanup_prompts(
             self.cfg.cleanup_prompts,
             self.cfg.cleanup_prompt or DEFAULT_CLEANUP_PROMPT,
         )
         history_size = max(1, int(self.cfg.cleanup_history_size))
-        self._cleanup_input_history: deque[str] = deque(maxlen=history_size)
-        self._cleanup_output_history: deque[str] = deque(maxlen=history_size)
-        self._cleanup_prompt_history: deque[str] = deque(maxlen=history_size)
+        if self._cleanup_input_history.maxlen != history_size:
+            self._cleanup_input_history = deque(self._cleanup_input_history, maxlen=history_size)
+            self._cleanup_output_history = deque(self._cleanup_output_history, maxlen=history_size)
+            self._cleanup_prompt_history = deque(self._cleanup_prompt_history, maxlen=history_size)
         if self.cfg.cleanup and self.cfg.cleanup_backend == "ollama" and not self.cfg.cleanup_model:
             self.cfg.cleanup_model = self._default_ollama_model()
         if self.cfg.cleanup and self.cfg.cleanup_backend in {"generic_v1", "api_v1", "lm_api_v1"} and not self.cfg.cleanup_model:
@@ -1223,10 +1257,7 @@ def main() -> int:
         return 0
 
     cfg = Config()
-    if cfg.cleanup_backend in {"generic_v1", "api_v1", "lm_api_v1"}:
-        parsed = urlparse(cfg.cleanup_url)
-        if parsed.scheme and parsed.netloc and parsed.path in {"", "/"}:
-            cfg.cleanup_url = cfg.cleanup_url.rstrip("/") + "/v1/chat"
+    cfg.cleanup_url = normalize_cleanup_url(cfg.cleanup_backend, cfg.cleanup_url)
     if cfg.ptt_duck_scope not in {"default", "all"}:
         cfg.ptt_duck_scope = "default"
     if cfg.paste_mode not in {"clipboard", "type", "primary"}:
@@ -1322,6 +1353,160 @@ def main() -> int:
     ptt_key = resolve_ptt_key(cfg.ptt_key)
     work_q: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
     stop_event = threading.Event()
+    runtime_overrides_path = os.environ.get("DICTATE_RUNTIME_ENV_FILE", "").strip()
+    runtime_overrides_mtime: float = 0.0
+
+    def _parse_bool_value(value: str, default: bool) -> bool:
+        s = value.strip().lower()
+        if not s:
+            return default
+        return s in {"1", "true", "yes", "on"}
+
+    def _apply_runtime_overrides(overrides: dict[str, str]) -> tuple[list[str], list[str]]:
+        changed: list[str] = []
+        restart_required: list[str] = []
+
+        def set_if_changed(attr: str, value) -> None:
+            if getattr(cfg, attr) != value:
+                setattr(cfg, attr, value)
+                changed.append(attr)
+
+        # Live-safe toggles/knobs.
+        if "DICTATE_DEBUG" in overrides:
+            set_if_changed("debug", _parse_bool_value(overrides["DICTATE_DEBUG"], cfg.debug))
+        if "DICTATE_DEBUG_KEYS" in overrides:
+            set_if_changed("debug_keys", _parse_bool_value(overrides["DICTATE_DEBUG_KEYS"], cfg.debug_keys))
+        if "DICTATE_FILE_LOG" in overrides:
+            set_if_changed("file_log_enabled", _parse_bool_value(overrides["DICTATE_FILE_LOG"], cfg.file_log_enabled))
+        if "DICTATE_PTT_AUTO_PAUSE_MEDIA" in overrides:
+            set_if_changed("ptt_auto_pause_media", _parse_bool_value(overrides["DICTATE_PTT_AUTO_PAUSE_MEDIA"], cfg.ptt_auto_pause_media))
+        if "DICTATE_PTT_DUCK_MEDIA" in overrides:
+            set_if_changed("ptt_duck_media", _parse_bool_value(overrides["DICTATE_PTT_DUCK_MEDIA"], cfg.ptt_duck_media))
+        if "DICTATE_PTT_DUCK_SCOPE" in overrides:
+            v = overrides["DICTATE_PTT_DUCK_SCOPE"].strip().lower()
+            if v not in {"default", "all"}:
+                v = "default"
+            set_if_changed("ptt_duck_scope", v)
+        if "DICTATE_PTT_DUCK_MEDIA_PERCENT" in overrides:
+            with contextlib.suppress(ValueError):
+                v = max(0, min(100, int(overrides["DICTATE_PTT_DUCK_MEDIA_PERCENT"].strip())))
+                set_if_changed("ptt_duck_media_percent", v)
+        if "DICTATE_PTT_AUTO_SUBMIT" in overrides:
+            set_if_changed("ptt_auto_submit", _parse_bool_value(overrides["DICTATE_PTT_AUTO_SUBMIT"], cfg.ptt_auto_submit))
+        if "DICTATE_CONTEXT_RESET_EVERY" in overrides:
+            with contextlib.suppress(ValueError):
+                set_if_changed("context_reset_every", int(overrides["DICTATE_CONTEXT_RESET_EVERY"].strip()))
+        if "DICTATE_TRIM_CHUNK_PERIOD" in overrides:
+            set_if_changed(
+                "trim_chunk_terminal_period",
+                _parse_bool_value(overrides["DICTATE_TRIM_CHUNK_PERIOD"], cfg.trim_chunk_terminal_period),
+            )
+        if "DICTATE_LOOP_GUARD" in overrides:
+            set_if_changed("loop_guard_enabled", _parse_bool_value(overrides["DICTATE_LOOP_GUARD"], cfg.loop_guard_enabled))
+
+        # Cleanup runtime settings.
+        cleanup_changed = False
+        for key, attr in (
+            ("DICTATE_CLEANUP", "cleanup"),
+            ("DICTATE_CLEANUP_PROMPT", "cleanup_prompt"),
+            ("DICTATE_CLEANUP_PROMPTS", "cleanup_prompts"),
+            ("DICTATE_CLEANUP_BACKEND", "cleanup_backend"),
+            ("DICTATE_CLEANUP_URL", "cleanup_url"),
+            ("DICTATE_CLEANUP_MODEL", "cleanup_model"),
+            ("DICTATE_CLEANUP_API_TOKEN", "cleanup_api_token"),
+            ("LM_API_TOKEN", "cleanup_api_token"),
+            ("DICTATE_CLEANUP_REASONING", "cleanup_reasoning"),
+        ):
+            if key not in overrides:
+                continue
+            v = overrides[key].strip()
+            if attr == "cleanup":
+                nv = _parse_bool_value(v, cfg.cleanup)
+            elif attr == "cleanup_backend":
+                nv = v.lower() or cfg.cleanup_backend
+            else:
+                nv = v
+            if getattr(cfg, attr) != nv:
+                setattr(cfg, attr, nv)
+                cleanup_changed = True
+                changed.append(attr)
+        if "DICTATE_CLEANUP_TEMPERATURE" in overrides:
+            with contextlib.suppress(ValueError):
+                nv = float(overrides["DICTATE_CLEANUP_TEMPERATURE"].strip())
+                if cfg.cleanup_temperature != nv:
+                    cfg.cleanup_temperature = nv
+                    cleanup_changed = True
+                    changed.append("cleanup_temperature")
+        if "DICTATE_CLEANUP_HISTORY_SIZE" in overrides:
+            with contextlib.suppress(ValueError):
+                nv = max(1, int(overrides["DICTATE_CLEANUP_HISTORY_SIZE"].strip()))
+                if cfg.cleanup_history_size != nv:
+                    cfg.cleanup_history_size = nv
+                    cleanup_changed = True
+                    changed.append("cleanup_history_size")
+        if cleanup_changed:
+            cfg.cleanup_url = normalize_cleanup_url(cfg.cleanup_backend, cfg.cleanup_url)
+            pipeline.refresh_cleanup_runtime_config()
+
+        # Restart-required settings (detected and reported only).
+        restart_env = {
+            "DICTATE_MODE",
+            "DICTATE_INPUT_DEVICE",
+            "DICTATE_INPUT_DEVICE_NAME",
+            "DICTATE_SAMPLE_RATE",
+            "DICTATE_PTT_KEY",
+            "DICTATE_STT_MODEL",
+            "DICTATE_STT_DEVICE",
+            "DICTATE_STT_COMPUTE",
+            "DICTATE_STT_CONDITION_PREV",
+            "DICTATE_STT_BEAM_SIZE",
+            "DICTATE_STT_NO_SPEECH_THRESHOLD",
+            "DICTATE_STT_LOGPROB_THRESHOLD",
+            "DICTATE_STT_COMPRESSION_RATIO_THRESHOLD",
+            "DICTATE_STT_TAIL_PAD_S",
+            "DICTATE_INPUT_LANGUAGE",
+            "DICTATE_LOOPBACK_CHUNK_S",
+            "DICTATE_LOOPBACK_HINT",
+            "DICTATE_PULSE_SOURCE",
+            "DICTATE_MIN_CHUNK_RMS",
+            "DICTATE_CONTEXT",
+            "DICTATE_CONTEXT_CHARS",
+            "DICTATE_AUDIO_CONTEXT_S",
+            "DICTATE_AUDIO_CONTEXT_PAD_S",
+            "DICTATE_LOOP_GUARD_REPEAT_RATIO",
+            "DICTATE_LOOP_GUARD_PUNCT_RATIO",
+            "DICTATE_LOOP_GUARD_SHORT_RUN",
+            "DICTATE_LOOP_GUARD_SHORT_LEN",
+            "DICTATE_PASTE",
+            "DICTATE_PASTE_MODE",
+            "DICTATE_PASTE_PRIMARY_CLICK",
+            "DICTATE_PASTE_PRESERVE",
+            "DICTATE_PASTE_RESTORE_DELAY_MS",
+        }
+        for key in sorted(k for k in overrides if k in restart_env):
+            restart_required.append(key)
+        return changed, restart_required
+
+    def poll_runtime_overrides() -> None:
+        nonlocal runtime_overrides_mtime
+        if not runtime_overrides_path:
+            return
+        path = Path(runtime_overrides_path)
+        try:
+            mtime = path.stat().st_mtime
+        except Exception:
+            return
+        if mtime <= runtime_overrides_mtime:
+            return
+        runtime_overrides_mtime = mtime
+        overrides = parse_env_overrides_file(path)
+        changed, restart_required = _apply_runtime_overrides(overrides)
+        if changed:
+            dlog(f"runtime update applied: {sorted(set(changed))}")
+            flog("RUNTIME", f"applied={sorted(set(changed))}")
+        if restart_required:
+            dlog(f"runtime update requires restart: {restart_required}")
+            flog("RUNTIME", f"restart_required={restart_required}")
 
     print(
         f"platform={platform.system().lower()} mode={cfg.mode} "
@@ -1577,6 +1762,7 @@ def main() -> int:
         try:
             while True:
                 time.sleep(1)
+                poll_runtime_overrides()
         except KeyboardInterrupt:
             pass
         finally:
@@ -1595,6 +1781,7 @@ def main() -> int:
             recorder.start()
             while True:
                 time.sleep(max(1, cfg.loopback_chunk_s))
+                poll_runtime_overrides()
                 audio = recorder.take_chunk()
                 work_q.put((audio, False))
                 dlog(f"queued chunk samples={audio.size}")
