@@ -38,6 +38,7 @@ FIELD_SPECS: list[FieldSpec] = [
     FieldSpec("DICTATE_FILE_LOG", "File Log", "bool", "1", "General"),
 
     FieldSpec("DICTATE_PASTE", "Paste Output", "bool", "1", "Output"),
+    FieldSpec("DICTATE_PASTE_ALIGN_FOCUS", "Align Paste to PTT Focus", "bool", "1", "Output"),
     FieldSpec("DICTATE_PASTE_MODE", "Paste Mode", "enum", "type", "Output", ("clipboard", "type", "primary")),
     FieldSpec("DICTATE_PASTE_PRIMARY_CLICK", "Primary Click Paste", "bool", "1", "Output"),
     FieldSpec("DICTATE_PASTE_PRESERVE", "Preserve Clipboard", "bool", "1", "Output"),
@@ -163,6 +164,7 @@ ENV_TOOLTIPS: dict[str, str] = {
     "DICTATE_DEBUG_KEYS": "Log key press/release events and push-to-talk matching decisions.",
     "DICTATE_FILE_LOG": "Append runtime events to `YYYYMMDD.log` files.",
     "DICTATE_PASTE": "Emit transcribed text into the active app using configured paste mode.",
+    "DICTATE_PASTE_ALIGN_FOCUS": "When enabled, capture focused window on PTT press; if focus changed by output time, paste into captured window, then restore focus.",
     "DICTATE_PASTE_MODE": "Output transport: `clipboard`, `type`, or `primary`.",
     "DICTATE_PASTE_PRIMARY_CLICK": "In Linux `primary` mode, trigger middle-click paste after setting PRIMARY selection.",
     "DICTATE_PASTE_PRESERVE": "Preserve/restore previous clipboard or PRIMARY content around paste.",

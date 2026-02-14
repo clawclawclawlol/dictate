@@ -203,6 +203,7 @@ class Config:
     paste_primary_click: bool = env_bool("DICTATE_PASTE_PRIMARY_CLICK", True)
     paste_preserve: bool = env_bool("DICTATE_PASTE_PRESERVE", True)
     paste_restore_delay_ms: int = env_int("DICTATE_PASTE_RESTORE_DELAY_MS", 80)
+    paste_align_focus: bool = env_bool("DICTATE_PASTE_ALIGN_FOCUS", True)
     debug: bool = env_bool("DICTATE_DEBUG", False)
     debug_keys: bool = env_bool("DICTATE_DEBUG_KEYS", False)
     min_chunk_rms: float = env_float("DICTATE_MIN_CHUNK_RMS", 0.0008)
@@ -607,28 +608,38 @@ class OutputSink:
         self._paste_mod = keyboard.Key.cmd if platform.system() == "Darwin" else keyboard.Key.ctrl
         self._has_output = False
 
-    def output(self, text: str) -> None:
+    def output(self, text: str, target_window_id: str | None = None) -> None:
         if not text or not self.cfg.paste:
             return
         if self._has_output:
             text = " " + text
         mode = self.cfg.paste_mode
+        restore_window_id: str | None = None
+        if self.cfg.paste_align_focus and target_window_id:
+            current_window_id = self._active_window_id()
+            if current_window_id and current_window_id != target_window_id:
+                if self._activate_window(target_window_id):
+                    restore_window_id = current_window_id
         target = self._active_window_desc()
         self._debug_log(f"paste target={target} mode={mode}")
-        if mode == "type":
-            self._kb.type(text)
-        elif mode == "primary":
-            with self._preserve_clipboards(primary=True, clipboard=True):
-                if not self._copy_primary_selection(text):
+        try:
+            if mode == "type":
+                self._kb.type(text)
+            elif mode == "primary":
+                with self._preserve_clipboards(primary=True, clipboard=True):
+                    if not self._copy_primary_selection(text):
+                        pyperclip.copy(text)
+                        self._paste_with_shortcut()
+                    elif platform.system() == "Linux" and self.cfg.paste_primary_click:
+                        with contextlib.suppress(Exception):
+                            self._mouse.click(MouseButton.middle, 1)
+            else:
+                with self._preserve_clipboards(primary=False, clipboard=True):
                     pyperclip.copy(text)
                     self._paste_with_shortcut()
-                elif platform.system() == "Linux" and self.cfg.paste_primary_click:
-                    with contextlib.suppress(Exception):
-                        self._mouse.click(MouseButton.middle, 1)
-        else:
-            with self._preserve_clipboards(primary=False, clipboard=True):
-                pyperclip.copy(text)
-                self._paste_with_shortcut()
+        finally:
+            if restore_window_id:
+                self._activate_window(restore_window_id)
         self._has_output = True
 
     def submit(self) -> None:
@@ -637,6 +648,11 @@ class OutputSink:
 
     def active_target_desc(self) -> str:
         return self._active_window_desc()
+
+    def capture_output_target(self) -> str | None:
+        if not self.cfg.paste_align_focus:
+            return None
+        return self._active_window_id()
 
     def _debug_log(self, msg: str) -> None:
         if self.cfg.debug:
@@ -746,6 +762,39 @@ class OutputSink:
             except Exception:
                 pass
         return "unknown"
+
+    @staticmethod
+    def _active_window_id() -> str | None:
+        if platform.system() != "Linux" or not shutil.which("xdotool"):
+            return None
+        try:
+            win_id = subprocess.check_output(
+                ["xdotool", "getactivewindow"],
+                text=True,
+                timeout=1,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            return win_id or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _activate_window(window_id: str) -> bool:
+        if platform.system() != "Linux" or not shutil.which("xdotool"):
+            return False
+        if not window_id:
+            return False
+        try:
+            subprocess.run(
+                ["xdotool", "windowactivate", "--sync", window_id],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+                check=True,
+            )
+            return True
+        except Exception:
+            return False
 
 
 class Pipeline:
@@ -956,14 +1005,17 @@ class Pipeline:
         self._remember_cleanup_exchange(text, result, system_prompt)
         return result
 
-    def output(self, text: str) -> None:
-        self._output.output(text)
+    def output(self, text: str, target_window_id: str | None = None) -> None:
+        self._output.output(text, target_window_id=target_window_id)
 
     def submit(self) -> None:
         self._output.submit()
 
     def active_target_desc(self) -> str:
         return self._output.active_target_desc()
+
+    def capture_output_target(self) -> str | None:
+        return self._output.capture_output_target()
 
     @staticmethod
     def _extract_cleanup_text(data: object) -> str:
@@ -1439,7 +1491,7 @@ def main() -> int:
     recorder = Recorder(cfg)
     pipeline = Pipeline(cfg)
     ptt_key = resolve_ptt_key(cfg.ptt_key)
-    work_q: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
+    work_q: queue.Queue[tuple[np.ndarray, bool, str | None]] = queue.Queue()
     stop_event = threading.Event()
     runtime_overrides_path = os.environ.get("DICTATE_RUNTIME_ENV_FILE", "").strip()
     runtime_overrides_mtime: float = 0.0
@@ -1466,6 +1518,8 @@ def main() -> int:
             set_if_changed("debug_keys", _parse_bool_value(overrides["DICTATE_DEBUG_KEYS"], cfg.debug_keys))
         if "DICTATE_FILE_LOG" in overrides:
             set_if_changed("file_log_enabled", _parse_bool_value(overrides["DICTATE_FILE_LOG"], cfg.file_log_enabled))
+        if "DICTATE_PASTE_ALIGN_FOCUS" in overrides:
+            set_if_changed("paste_align_focus", _parse_bool_value(overrides["DICTATE_PASTE_ALIGN_FOCUS"], cfg.paste_align_focus))
         if "DICTATE_PTT_AUTO_PAUSE_MEDIA" in overrides:
             set_if_changed("ptt_auto_pause_media", _parse_bool_value(overrides["DICTATE_PTT_AUTO_PAUSE_MEDIA"], cfg.ptt_auto_pause_media))
         if "DICTATE_PTT_DUCK_MEDIA" in overrides:
@@ -1600,7 +1654,8 @@ def main() -> int:
         f"platform={platform.system().lower()} mode={cfg.mode} "
         f"ptt={cfg.ptt_key} stt={cfg.stt_model} cleanup_backend={cfg.cleanup_backend} "
         f"cleanup_model={cfg.cleanup_model or 'disabled'} "
-        f"paste={cfg.paste} paste_mode={cfg.paste_mode}"
+        f"paste={cfg.paste} paste_mode={cfg.paste_mode} "
+        f"paste_align_focus={cfg.paste_align_focus}"
     , flush=True)
     dlog(f"sample_rate={cfg.sample_rate} stt_device={cfg.stt_device} stt_compute={cfg.stt_compute_type}")
     dlog(
@@ -1661,7 +1716,7 @@ def main() -> int:
         ok_since_reset = 0
         while not stop_event.is_set():
             try:
-                audio, submit_after = work_q.get(timeout=0.5)
+                audio, submit_after, target_window_id = work_q.get(timeout=0.5)
             except queue.Empty:
                 continue
             chunk_no += 1
@@ -1724,7 +1779,7 @@ def main() -> int:
             dlog(f"chunk#{chunk_no}: cleanup_ms={(time.time()-t1)*1000:.0f}")
             flog("MODEL_RESULT", f"n={chunk_no} model=cleanup ms={(time.time()-t1)*1000:.0f} text={final!r}")
             if final:
-                pipeline.output(final)
+                pipeline.output(final, target_window_id=target_window_id)
                 if submit_after:
                     pipeline.submit()
                 clear_ptt_indicator()
@@ -1748,6 +1803,7 @@ def main() -> int:
 
     held = False
     shift_held = False
+    output_target_on_press: str | None = None
     ducked_sink_states: dict[str, tuple[float, bool]] = {}
     players_playing_on_press: list[str] = []
     players_paused_by_app: list[str] = []
@@ -1756,13 +1812,14 @@ def main() -> int:
         return k in {keyboard.Key.shift, keyboard.Key.shift_l, keyboard.Key.shift_r}
 
     def on_press(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app
+        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app, output_target_on_press
         if cfg.debug and cfg.debug_keys:
             dlog(f"key press: {k!r} matches_ptt={k == ptt_key}")
         if _is_shift_key(k):
             shift_held = True
         if k == ptt_key and not held:
             held = True
+            output_target_on_press = pipeline.capture_output_target()
             try:
                 recorder.start()
                 show_ptt_indicator()
@@ -1805,10 +1862,11 @@ def main() -> int:
                 dlog("ptt pressed: recording started")
             except Exception as e:
                 held = False
+                output_target_on_press = None
                 print(f"record start failed: {e}")
 
     def on_release(k: keyboard.Key | keyboard.KeyCode | None) -> None:
-        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app
+        nonlocal held, shift_held, ducked_sink_states, players_playing_on_press, players_paused_by_app, output_target_on_press
         if cfg.debug and cfg.debug_keys:
             dlog(f"key release: {k!r} matches_ptt={k == ptt_key}")
         if _is_shift_key(k):
@@ -1817,7 +1875,8 @@ def main() -> int:
             held = False
             audio = recorder.stop()
             submit_after = cfg.mode == "ptt" and cfg.ptt_auto_submit and not shift_held
-            work_q.put((audio, submit_after))
+            work_q.put((audio, submit_after, output_target_on_press))
+            output_target_on_press = None
             dlog("ptt released: queued audio chunk")
             if cfg.mode == "ptt" and platform.system() == "Linux":
                 if cfg.ptt_duck_media and ducked_sink_states:
@@ -1873,7 +1932,7 @@ def main() -> int:
                 time.sleep(max(1, cfg.loopback_chunk_s))
                 poll_runtime_overrides()
                 audio = recorder.take_chunk()
-                work_q.put((audio, False))
+                work_q.put((audio, False, None))
                 dlog(f"queued chunk samples={audio.size}")
         except KeyboardInterrupt:
             pass

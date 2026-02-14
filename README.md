@@ -53,6 +53,7 @@ dictate-min --list-input-devices
 - `DICTATE_INPUT_DEVICE_NAME`: case-insensitive input-name substring match (used when `DICTATE_INPUT_DEVICE` is unset)
 - `DICTATE_SAMPLE_RATE`: input sample rate hint (default `16000`, auto-falls back if unsupported)
 - `DICTATE_PASTE`: `1` or `0` (default `1` in `ptt`, `0` in `loopback`)
+- `DICTATE_PASTE_ALIGN_FOCUS`: `1` or `0` (default `1`); capture focused window on PTT press and paste there even if focus changed before output, then restore focus to the newer window
 - `DICTATE_PASTE_MODE`: `clipboard`, `type`, `primary` (default `type` on Linux, `clipboard` otherwise)
   - invalid values fall back to `clipboard`
 - `DICTATE_PASTE_PRIMARY_CLICK`: for `primary` mode on Linux, trigger middle-click paste after setting PRIMARY selection (default `1`)
@@ -62,7 +63,7 @@ dictate-min --list-input-devices
 - `DICTATE_DEBUG_KEYS`: `1` to log every key press/release and whether it matches PTT (default `0`)
 - `DICTATE_FILE_LOG`: `1` to append runtime/model/output events to `YYYYMMDD.log` (default `1`)
 - `DICTATE_RUNTIME_ENV_FILE`: optional path to a runtime `.env` overrides file polled while running for hot updates (default disabled)
-  - hot-reloadable: debug flags, most cleanup settings, `DICTATE_PTT_AUTO_PAUSE_MEDIA`, ducking settings, `DICTATE_PTT_AUTO_SUBMIT`, `DICTATE_CONTEXT_RESET_EVERY`, `DICTATE_TRIM_CHUNK_PERIOD`, `DICTATE_LOOP_GUARD`
+  - hot-reloadable: debug flags, most cleanup settings, `DICTATE_PTT_AUTO_PAUSE_MEDIA`, ducking settings, `DICTATE_PTT_AUTO_SUBMIT`, `DICTATE_CONTEXT_RESET_EVERY`, `DICTATE_TRIM_CHUNK_PERIOD`, `DICTATE_LOOP_GUARD`, `DICTATE_PASTE_ALIGN_FOCUS`
   - restart-required: mode/device/STT engine settings, paste transport settings, and most audio pipeline geometry settings
 
 ### Push-to-talk mode
