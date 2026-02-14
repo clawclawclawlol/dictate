@@ -2,7 +2,9 @@
 
 ![Dictate GUI screenshot](2026-02-14-090605_1067x790_scrot.png)
 
-Minimal push-to-talk dictation clone (Linux/macOS).
+Minimal push-to-talk desktop dictation app.
+
+Reimplemented from scratch, embeddable, cross platform possible. 
 
 ## Quick Start
 
