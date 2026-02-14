@@ -2,44 +2,46 @@
 
 Minimal push-to-talk dictation clone (Linux/macOS).
 
-## Run
+## Quick Start
+
+### Desktop GUI (recommended)
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
-dictate-min
-```
-
-Run desktop GUI:
-
-```bash
 python3 gui.py
 ```
 
-List input devices:
+### CLI
+
+```bash
+dictate-min
+```
+
+### List Input Devices
 
 ```bash
 dictate-min --list-input-devices
 ```
+
+## GUI
+
+- `gui.py` is a desktop configuration UI (`tkinter/ttk`, no extra GUI dependencies).
+- Features:
+  - grouped env controls (toggles, dropdowns, text fields)
+  - preset profiles
+  - input device dropdowns (`Refresh Input Devices`)
+  - model dropdowns (`Refresh Models`) for STT and cleanup backends
+  - live runtime apply while `dictate-min` is running
+  - optional auto-restart for restart-required settings (`Auto Restart`, enabled by default)
+- Live runtime updates are written to `.dictate-runtime.env` and consumed via `DICTATE_RUNTIME_ENV_FILE`.
 
 ## Controls
 
 - Hold configured PTT key (default `Right Ctrl`) to record.
 - Release to transcribe and paste into the active app.
 - `Ctrl+C` to quit.
-
-## GUI
-
-- `gui.py` is a desktop configuration UI (tkinter/ttk, no extra GUI dependencies).
-- Supports:
-  - grouped env controls (toggles, dropdowns, text fields)
-  - preset profiles
-  - input device dropdowns (`Refresh Input Devices`)
-  - model dropdowns (`Refresh Models`) for STT presets and cleanup backends
-  - live runtime apply while `dictate-min` is running
-  - optional auto-restart for restart-required settings (`Auto Restart`, enabled by default)
-- Runtime live updates are written to `.dictate-runtime.env` and used via `DICTATE_RUNTIME_ENV_FILE`.
 
 ## Environment variables
 
