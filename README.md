@@ -11,6 +11,12 @@ pip install -e .
 dictate-min
 ```
 
+Run desktop GUI:
+
+```bash
+python3 gui.py
+```
+
 List input devices:
 
 ```bash
@@ -22,6 +28,18 @@ dictate-min --list-input-devices
 - Hold configured PTT key (default `Right Ctrl`) to record.
 - Release to transcribe and paste into the active app.
 - `Ctrl+C` to quit.
+
+## GUI
+
+- `gui.py` is a desktop configuration UI (tkinter/ttk, no extra GUI dependencies).
+- Supports:
+  - grouped env controls (toggles, dropdowns, text fields)
+  - preset profiles
+  - input device dropdowns (`Refresh Input Devices`)
+  - model dropdowns (`Refresh Models`) for STT presets and cleanup backends
+  - live runtime apply while `dictate-min` is running
+  - optional auto-restart for restart-required settings (`Auto Restart`, enabled by default)
+- Runtime live updates are written to `.dictate-runtime.env` and used via `DICTATE_RUNTIME_ENV_FILE`.
 
 ## Environment variables
 
@@ -114,8 +132,9 @@ dictate-min --list-input-devices
 ## Notes
 
 - STT is `faster-whisper` (works on Linux; no MLX required).
-- Cleanup uses Ollama chat API.
-- Your Ollama build does not expose `/api/transcribe`, so Ollama is used for cleanup only in this version.
+- Cleanup supports `ollama` and `generic_v1`-style backends.
+- Legacy `DICTATE_OLLAMA_URL` / `DICTATE_OLLAMA_MODEL` are still accepted as compatibility aliases.
+- Ollama is used for cleanup only (STT is not routed through Ollama in this app).
 - If CUDA init fails, set `DICTATE_STT_DEVICE=cpu` explicitly for stable fallback.
 
 ## Linux speaker-output test (no hotkey)
@@ -160,6 +179,11 @@ Where transcription goes:
 ### 1) Basic PTT (type into focused app)
 ```bash
 dictate-min
+```
+
+### 1b) Start desktop GUI
+```bash
+python3 gui.py
 ```
 
 ### 2) Loopback transcription only (no paste), debug on
