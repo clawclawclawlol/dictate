@@ -139,6 +139,51 @@ dictate-min --list-input-devices
 - Ollama is used for cleanup only (STT is not routed through Ollama in this app).
 - If CUDA init fails, set `DICTATE_STT_DEVICE=cpu` explicitly for stable fallback.
 
+## Roadmap
+
+### 1) Cross-Platform Refactor
+- Split platform-specific code into adapters (audio routing, key hooks, paste, media control).
+- Define a shared runtime core (`config`, `pipeline`, `state`, `events`) with platform modules:
+  - `platform/linux.py`
+  - `platform/macos.py`
+  - `platform/windows.py`
+- Remove Linux-specific assumptions from startup and runtime hot paths.
+- Add feature-capability probing so unsupported features degrade gracefully per OS.
+
+### 2) Cleanup Backend Expansion
+- Keep current backends:
+  - `ollama`
+  - `generic_v1` (`/api/v1/chat` / `/v1/chat`)
+- Add providers with first-class schema adapters:
+  - OpenAI-compatible chat endpoints
+  - Anthropic-style message APIs
+  - Additional local gateways as adapter plugins
+- Improve model discovery and selection policy:
+  - prefer loaded model
+  - support pinned model aliases
+  - optional fail-fast on missing model
+
+### 3) STT Backend Expansion
+- Keep `faster-whisper` as default baseline.
+- Add pluggable STT engine interface for:
+  - alternate local Whisper runtimes
+  - cloud STT providers
+  - platform-native dictation APIs (where available)
+- Standardize STT output normalization (timestamps, confidence, no-speech handling).
+
+### 4) Runtime Config + GUI Maturity
+- Expand hot-reload coverage where safe and keep strict restart boundaries where required.
+- Add explicit “restart needed” diagnostics in CLI logs and GUI state.
+- Add profile import/export and per-project profile switching.
+
+### 5) Reliability + Test Coverage
+- Add automated tests for:
+  - prompt rule parsing/templating
+  - runtime override application
+  - duck/pause/resume state machines
+  - backend response parsing edge cases
+- Add integration smoke tests for `dictate-min` and `gui.py` launch paths.
+
 ## Linux speaker-output test (no hotkey)
 
 Use loopback mode to transcribe whatever is playing on a loopback/monitor input device:
