@@ -1,5 +1,7 @@
 # dictate-min
 
+![Dictate GUI screenshot](2026-02-14-090605_1067x790_scrot.png)
+
 Minimal push-to-talk dictation clone (Linux/macOS).
 
 ## Quick Start
@@ -91,6 +93,7 @@ dictate-min --list-input-devices
   - matching is case-insensitive substring against active window title
   - if multiple rules match, only the last matching rule is sent
   - if none match, the default prompt is used (when provided in `;; default prompt` form), else `DICTATE_CLEANUP_PROMPT`
+  - if no rule matches and the resolved default prompt is empty, cleanup is skipped (no cleanup model request is sent) even when `DICTATE_CLEANUP=1`
   - prompt templates support placeholders:
     - current: `{input}`, `{target}`, `{backend}`, `{model}`
     - previous single: `{prev_input}`, `{prev_output}`, `{prev_prompt}`
@@ -138,6 +141,25 @@ dictate-min --list-input-devices
 - Legacy `DICTATE_OLLAMA_URL` / `DICTATE_OLLAMA_MODEL` are still accepted as compatibility aliases.
 - Ollama is used for cleanup only (STT is not routed through Ollama in this app).
 - If CUDA init fails, set `DICTATE_STT_DEVICE=cpu` explicitly for stable fallback.
+
+## Troubleshooting
+
+- ALSA/PortAudio stream-open failures like:
+  - `Expression 'AlsaOpen(...)' failed`
+  - `Expression 'PaAlsaStream_Initialize(...)' failed`
+  typically mean PortAudio could see a device but could not open it with current capture parameters/backend routing.
+- Common causes:
+  - stale `DICTATE_INPUT_DEVICE` index after device reorder
+  - loopback source/backend mismatch (`pulse` source not actually available at open time)
+  - sample-rate/channel constraints on the selected source
+  - transient device busy state during backend switch/restart
+- Runtime behavior:
+  - on stream-open failure, app now retries by refreshing a stale numeric device index from its current device name, then retries once with default input device
+- Quick checks:
+  - refresh device list: `dictate-min --list-input-devices`
+  - prefer name-based selection: set `DICTATE_INPUT_DEVICE_NAME` and clear `DICTATE_INPUT_DEVICE`
+  - in loopback mode, set `DICTATE_PULSE_SOURCE` explicitly to the active monitor source
+  - if needed, set `DICTATE_SAMPLE_RATE` to the source native rate (often `48000`)
 
 ## Roadmap
 

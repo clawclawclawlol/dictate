@@ -250,12 +250,56 @@ class Recorder:
             self.recording = True
 
         try:
-            self.stream = sd.InputStream(
+            self.stream = self._open_and_start_stream(self.cfg.device_id)
+        except sd.PortAudioError as first_error:
+            # Try recovering stale device indices before failing hard.
+            recovered = False
+            last_error: BaseException = first_error
+            refreshed = self._refresh_device_id_from_current_name()
+            if refreshed is not None:
+                recovered = True
+                try:
+                    self.stream = self._open_and_start_stream(self.cfg.device_id)
+                except sd.PortAudioError as e:
+                    last_error = e
+            if self.stream is None:
+                default_id = self._default_input_device_id()
+                if default_id is not None and default_id != self.cfg.device_id:
+                    recovered = True
+                    old = self.cfg.device_id
+                    self.cfg.device_id = default_id
+                    print(
+                        f"audio: retrying stream open with default input device {default_id} "
+                        f"(was {old})",
+                        flush=True,
+                    )
+                    try:
+                        self.stream = self._open_and_start_stream(self.cfg.device_id)
+                    except sd.PortAudioError as e:
+                        last_error = e
+            if self.stream is None:
+                if not recovered:
+                    raise first_error
+                raise last_error
+        except Exception:
+            with self.lock:
+                self.recording = False
+            self.stream = None
+            raise
+
+    def _open_and_start_stream(self, device_id: int | None) -> sd.InputStream:
+        stream = self._open_stream_with_sample_rate_fallback(device_id)
+        stream.start()
+        return stream
+
+    def _open_stream_with_sample_rate_fallback(self, device_id: int | None) -> sd.InputStream:
+        try:
+            return sd.InputStream(
                 samplerate=self.cfg.sample_rate,
                 channels=self.cfg.channels,
                 dtype="float32",
                 blocksize=self.cfg.block_size,
-                device=self.cfg.device_id,
+                device=device_id,
                 callback=self._on_audio,
             )
         except sd.PortAudioError as e:
@@ -263,19 +307,57 @@ class Recorder:
             msg = str(e).lower()
             if "invalid sample rate" not in msg:
                 raise
-            info = sd.query_devices(self.cfg.device_id)
+            info = sd.query_devices(device_id)
             native = int(float(info.get("default_samplerate", self.cfg.sample_rate)))
-            print(f"audio: sample_rate {self.cfg.sample_rate} unsupported on device {self.cfg.device_id}; using {native}")
-            self.cfg.sample_rate = native
-            self.stream = sd.InputStream(
+            if native != self.cfg.sample_rate:
+                print(
+                    f"audio: sample_rate {self.cfg.sample_rate} unsupported on device {device_id}; using {native}",
+                    flush=True,
+                )
+                self.cfg.sample_rate = native
+            return sd.InputStream(
                 samplerate=self.cfg.sample_rate,
                 channels=self.cfg.channels,
                 dtype="float32",
                 blocksize=self.cfg.block_size,
-                device=self.cfg.device_id,
+                device=device_id,
                 callback=self._on_audio,
             )
-        self.stream.start()
+
+    def _refresh_device_id_from_current_name(self) -> int | None:
+        if self.cfg.device_id is None:
+            return None
+        try:
+            info = sd.query_devices(self.cfg.device_id)
+        except Exception:
+            return None
+        current_name = str(info.get("name", "")).strip()
+        if not current_name:
+            return None
+        refreshed = _find_input_device_by_name(current_name)
+        if refreshed is None or refreshed == self.cfg.device_id:
+            return None
+        old = self.cfg.device_id
+        self.cfg.device_id = refreshed
+        print(
+            f"audio: input device open failed; refreshed device id {old} -> {refreshed} "
+            f"by name '{current_name}'",
+            flush=True,
+        )
+        return refreshed
+
+    @staticmethod
+    def _default_input_device_id() -> int | None:
+        try:
+            default_input = sd.default.device[0]
+            if default_input is None:
+                return None
+            idx = int(default_input)
+            if idx < 0:
+                return None
+            return idx
+        except Exception:
+            return None
 
     def stop(self) -> np.ndarray:
         with self.lock:
@@ -657,6 +739,7 @@ class OutputSink:
                     ["xdotool", "getactivewindow", "getwindowname"],
                     text=True,
                     timeout=1,
+                    stderr=subprocess.DEVNULL,
                 ).strip()
                 if title:
                     return title
@@ -670,7 +753,7 @@ class Pipeline:
         self.cfg = cfg
         self._stt = SttEngine(cfg)
         self._output = OutputSink(cfg)
-        self._default_cleanup_prompt = self.cfg.cleanup_prompt or DEFAULT_CLEANUP_PROMPT
+        self._default_cleanup_prompt = self.cfg.cleanup_prompt
         self._cleanup_prompt_rules: list[tuple[str, str]] = []
         self._cleanup_input_history: deque[str] = deque(maxlen=max(1, int(self.cfg.cleanup_history_size)))
         self._cleanup_output_history: deque[str] = deque(maxlen=max(1, int(self.cfg.cleanup_history_size)))
@@ -680,7 +763,7 @@ class Pipeline:
     def refresh_cleanup_runtime_config(self) -> None:
         self._default_cleanup_prompt, self._cleanup_prompt_rules = parse_cleanup_prompts(
             self.cfg.cleanup_prompts,
-            self.cfg.cleanup_prompt or DEFAULT_CLEANUP_PROMPT,
+            self.cfg.cleanup_prompt,
         )
         history_size = max(1, int(self.cfg.cleanup_history_size))
         if self._cleanup_input_history.maxlen != history_size:
@@ -786,6 +869,11 @@ class Pipeline:
         if self.cfg.cleanup_api_token:
             headers["Authorization"] = f"Bearer {self.cfg.cleanup_api_token}"
         raw_system_prompt = self._resolve_cleanup_prompt(target_desc)
+        if not raw_system_prompt.strip():
+            self._cleanup_debug(
+                f"prompt disabled target={target_desc!r}; skipping cleanup request"
+            )
+            return text
         prev_inputs = list(reversed(self._cleanup_input_history))
         prev_outputs = list(reversed(self._cleanup_output_history))
         prev_prompts = list(reversed(self._cleanup_prompt_history))
@@ -937,7 +1025,7 @@ class Pipeline:
             return selected_prompt
         if self._cleanup_prompt_rules:
             self._cleanup_debug(f"prompt no-match target={target_desc!r}; using default cleanup prompt")
-        return self._default_cleanup_prompt or DEFAULT_CLEANUP_PROMPT
+        return self._default_cleanup_prompt
 
     @staticmethod
     def _looks_clean(text: str) -> bool:
@@ -1631,6 +1719,8 @@ def main() -> int:
             flog("MODEL_CALL", f"n={chunk_no} model=cleanup backend={cfg.cleanup_backend} enabled={cleanup_enabled}")
             target_desc = pipeline.active_target_desc()
             final = pipeline.cleanup(text, target_desc=target_desc)
+            if submit_after:
+                final = final.rstrip()
             dlog(f"chunk#{chunk_no}: cleanup_ms={(time.time()-t1)*1000:.0f}")
             flog("MODEL_RESULT", f"n={chunk_no} model=cleanup ms={(time.time()-t1)*1000:.0f} text={final!r}")
             if final:
@@ -1638,7 +1728,7 @@ def main() -> int:
                 if submit_after:
                     pipeline.submit()
                 clear_ptt_indicator()
-                sys.stdout.write(final + " ")
+                sys.stdout.write(final if submit_after else (final + " "))
                 sys.stdout.flush()
                 flog("OUTPUT", f"n={chunk_no} text={final!r}")
                 if submit_after:

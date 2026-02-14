@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import queue
+import re
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -151,6 +152,63 @@ PRESETS: dict[str, dict[str, str]] = {
     },
 }
 
+ENV_TOOLTIPS: dict[str, str] = {
+    "DICTATE_MODE": "Run mode: `ptt` records on push-to-talk key, `loopback` continuously captures output loopback audio.",
+    "DICTATE_PTT_KEY": "Hotkey used for push-to-talk recording.",
+    "DICTATE_INPUT_DEVICE": "Numeric audio input device index. Overrides name-based matching when set.",
+    "DICTATE_INPUT_DEVICE_NAME": "Case-insensitive input device name substring match when no numeric device index is set.",
+    "DICTATE_INPUT_LANGUAGE": "Whisper language code, or `auto` to detect automatically.",
+    "DICTATE_SAMPLE_RATE": "Input sample rate hint in Hz. Falls back automatically if unsupported.",
+    "DICTATE_DEBUG": "Enable verbose runtime diagnostics in logs.",
+    "DICTATE_DEBUG_KEYS": "Log key press/release events and push-to-talk matching decisions.",
+    "DICTATE_FILE_LOG": "Append runtime events to `YYYYMMDD.log` files.",
+    "DICTATE_PASTE": "Emit transcribed text into the active app using configured paste mode.",
+    "DICTATE_PASTE_MODE": "Output transport: `clipboard`, `type`, or `primary`.",
+    "DICTATE_PASTE_PRIMARY_CLICK": "In Linux `primary` mode, trigger middle-click paste after setting PRIMARY selection.",
+    "DICTATE_PASTE_PRESERVE": "Preserve/restore previous clipboard or PRIMARY content around paste.",
+    "DICTATE_PASTE_RESTORE_DELAY_MS": "Delay before clipboard restore to avoid target-app paste races.",
+    "DICTATE_PTT_AUTO_PAUSE_MEDIA": "Pause media playback when PTT starts (Linux).",
+    "DICTATE_PTT_DUCK_MEDIA": "Lower output sink volume while PTT is held (Linux).",
+    "DICTATE_PTT_DUCK_SCOPE": "Ducking target scope: `default` sink or `all` non-monitor sinks.",
+    "DICTATE_PTT_DUCK_MEDIA_PERCENT": "Target media volume percent while ducking is active.",
+    "DICTATE_PTT_AUTO_SUBMIT": "Press Enter after emitting each PTT chunk. Hold Shift on release to suppress per chunk.",
+    "DICTATE_LOOPBACK_CHUNK_S": "Chunk size in seconds for loopback capture mode.",
+    "DICTATE_LOOPBACK_HINT": "Name hint used when auto-selecting non-pulse loopback devices.",
+    "DICTATE_PULSE_SOURCE": "Force a specific PulseAudio/PipeWire source name, e.g. `sink.monitor`.",
+    "DICTATE_MIN_CHUNK_RMS": "Skip chunks below this RMS threshold as near-silent.",
+    "DICTATE_STT_MODEL": "faster-whisper model name, e.g. `tiny`, `small`, `medium.en`, `large-v3`.",
+    "DICTATE_STT_DEVICE": "Whisper device: `cpu`, `auto`, or `cuda`.",
+    "DICTATE_STT_COMPUTE": "Whisper compute type, e.g. `int8` or `float16`. Empty uses automatic selection.",
+    "DICTATE_STT_CONDITION_PREV": "Enable Whisper `condition_on_previous_text` behavior.",
+    "DICTATE_STT_BEAM_SIZE": "Whisper beam-search width.",
+    "DICTATE_STT_NO_SPEECH_THRESHOLD": "No-speech probability threshold for dropping segments.",
+    "DICTATE_STT_LOGPROB_THRESHOLD": "Log-probability threshold for filtering low-confidence segments.",
+    "DICTATE_STT_COMPRESSION_RATIO_THRESHOLD": "Compression-ratio threshold used to detect degenerate decoding output.",
+    "DICTATE_STT_TAIL_PAD_S": "Trailing silence appended before decode to reduce end-of-chunk hallucinations.",
+    "DICTATE_CONTEXT": "Enable text context carryover between emitted chunks.",
+    "DICTATE_CONTEXT_CHARS": "Maximum retained context characters.",
+    "DICTATE_CONTEXT_RESET_EVERY": "Reset context every N emitted chunks (`0` disables periodic reset).",
+    "DICTATE_AUDIO_CONTEXT_S": "Audio overlap seconds prepended from previous chunk.",
+    "DICTATE_AUDIO_CONTEXT_PAD_S": "Overlap pad used for timestamp clipping around the context boundary.",
+    "DICTATE_TRIM_CHUNK_PERIOD": "Trim trailing `.` or `...` from chunk output.",
+    "DICTATE_LOOP_GUARD": "Enable pathological loop detection and context reset safeguards.",
+    "DICTATE_LOOP_GUARD_REPEAT_RATIO": "Loop guard repetition trigger ratio.",
+    "DICTATE_LOOP_GUARD_PUNCT_RATIO": "Loop guard punctuation-density trigger ratio.",
+    "DICTATE_LOOP_GUARD_SHORT_RUN": "Loop guard repeated short-token run trigger length.",
+    "DICTATE_LOOP_GUARD_SHORT_LEN": "Maximum token length counted as `short` in loop-run detection.",
+    "DICTATE_CLEANUP": "Enable cleanup pass over raw transcription output.",
+    "DICTATE_CLEANUP_BACKEND": "Cleanup backend: `ollama` or OpenAI-compatible `generic_v1` aliases.",
+    "DICTATE_CLEANUP_URL": "Cleanup chat endpoint URL.",
+    "DICTATE_CLEANUP_MODEL": "Cleanup model name. Can be auto-discovered for supported backends.",
+    "DICTATE_CLEANUP_API_TOKEN": "Bearer token used for cleanup backend authorization.",
+    "LM_API_TOKEN": "Primary API token alias for cleanup backend authorization.",
+    "DICTATE_CLEANUP_PROMPT": "Default cleanup system prompt.",
+    "DICTATE_CLEANUP_PROMPTS": "Window-title prompt override rules (`/match/prompt`) with optional default fallback.",
+    "DICTATE_CLEANUP_REASONING": "Reasoning mode option for generic_v1 payloads.",
+    "DICTATE_CLEANUP_TEMPERATURE": "Sampling temperature for generic_v1 cleanup requests.",
+    "DICTATE_CLEANUP_HISTORY_SIZE": "Number of prior cleanup exchanges kept for prompt template placeholders.",
+}
+
 
 def parse_env_file(path: Path) -> dict[str, str]:
     data: dict[str, str] = {}
@@ -185,6 +243,62 @@ class ScrollableFrame(ttk.Frame):
         vscroll.pack(side="right", fill="y")
 
 
+class Tooltip:
+    def __init__(self, widget: tk.Widget, text: str, delay_ms: int = 350) -> None:
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id: str | None = None
+        self._tip: tk.Toplevel | None = None
+        widget.bind("<Enter>", self._on_enter, add="+")
+        widget.bind("<Leave>", self._on_leave, add="+")
+        widget.bind("<ButtonPress>", self._on_leave, add="+")
+
+    def _on_enter(self, _event: tk.Event[tk.Widget]) -> None:
+        self._schedule_show()
+
+    def _on_leave(self, _event: tk.Event[tk.Widget]) -> None:
+        self._cancel()
+        self._hide()
+
+    def _schedule_show(self) -> None:
+        self._cancel()
+        self._after_id = self.widget.after(self.delay_ms, self._show)
+
+    def _cancel(self) -> None:
+        if self._after_id is not None:
+            self.widget.after_cancel(self._after_id)
+            self._after_id = None
+
+    def _show(self) -> None:
+        self._after_id = None
+        if self._tip is not None:
+            return
+        x = self.widget.winfo_rootx() + 12
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        self._tip = tk.Toplevel(self.widget)
+        self._tip.wm_overrideredirect(True)
+        self._tip.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(
+            self._tip,
+            text=self.text,
+            justify="left",
+            background="#111827",
+            foreground="#f8fafc",
+            relief="solid",
+            borderwidth=1,
+            padx=8,
+            pady=6,
+            wraplength=560,
+        )
+        label.pack()
+
+    def _hide(self) -> None:
+        if self._tip is not None:
+            self._tip.destroy()
+            self._tip = None
+
+
 class DictateGui(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -205,6 +319,7 @@ class DictateGui(tk.Tk):
         self._pending_changed_keys: set[str] = set()
         self._pending_apply_after_id: str | None = None
         self._input_devices: list[tuple[str, str]] = []
+        self._tooltips: list[Tooltip] = []
 
         self._setup_style()
         self._build_ui()
@@ -274,16 +389,22 @@ class DictateGui(tk.Tk):
             tab = ScrollableFrame(notebook)
             notebook.add(tab, text=section)
             self._render_section(tab.inner, section)
+        docs_tab = ttk.Frame(notebook)
+        notebook.add(docs_tab, text="Documentation")
+        self._render_documentation(docs_tab)
 
         log_frame = ttk.Labelframe(body, text="Runtime Log", padding=8)
         body.add(log_frame, weight=2)
         self._log = tk.Text(log_frame, height=12, wrap="word", bg="#0b1220", fg="#d1d9e6", insertbackground="#d1d9e6")
+        self._log.tag_configure("log_error", foreground="#ef4444")
+        self._log.tag_configure("log_warn", foreground="#f59e0b")
         self._log.pack(fill="both", expand=True)
 
     def _render_section(self, parent: ttk.Frame, section: str) -> None:
         row = 0
         for spec in [s for s in FIELD_SPECS if s.section == section]:
-            ttk.Label(parent, text=spec.label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
+            label = ttk.Label(parent, text=spec.label)
+            label.grid(row=row, column=0, sticky="w", padx=(0, 12), pady=6)
             if spec.kind == "bool":
                 var = tk.BooleanVar(value=(spec.default == "1"))
                 w = ttk.Checkbutton(parent, variable=var)
@@ -301,14 +422,95 @@ class DictateGui(tk.Tk):
                 show = "*" if "TOKEN" in spec.name else ""
                 w = ttk.Entry(parent, textvariable=var, width=spec.width, show=show)
                 w.grid(row=row, column=1, sticky="ew", pady=6)
-            ttk.Label(parent, text=spec.name, style="Sub.TLabel").grid(row=row, column=2, sticky="w", padx=(10, 0), pady=6)
+            env_label = ttk.Label(parent, text=spec.name, style="Sub.TLabel")
+            env_label.grid(row=row, column=2, sticky="w", padx=(10, 0), pady=6)
             if spec.name in RESTART_REQUIRED_ENV:
                 ttk.Label(parent, text="restart", style="Warn.TLabel").grid(row=row, column=3, sticky="w", padx=(8, 0), pady=6)
             self._vars[spec.name] = var
             self._widgets[spec.name] = w
+            tip = self._tooltip_text(spec.name)
+            self._add_tooltip(label, tip)
+            self._add_tooltip(w, tip)
+            self._add_tooltip(env_label, tip)
             var.trace_add("write", lambda *_args, key=spec.name: self._on_var_changed(key))
             row += 1
         parent.columnconfigure(1, weight=1)
+
+    def _tooltip_text(self, name: str) -> str:
+        details = ENV_TOOLTIPS.get(name, "No description available in README.")
+        if name in RESTART_REQUIRED_ENV:
+            return f"{name}\n{details}\nChange requires restart of dictate-min."
+        return f"{name}\n{details}"
+
+    def _add_tooltip(self, widget: tk.Widget, text: str) -> None:
+        self._tooltips.append(Tooltip(widget, text))
+
+    def _render_documentation(self, parent: ttk.Frame) -> None:
+        frame = ttk.Frame(parent, padding=8)
+        frame.pack(fill="both", expand=True)
+        text = tk.Text(
+            frame,
+            wrap="word",
+            bg="#ffffff",
+            fg="#0f172a",
+            insertbackground="#0f172a",
+            relief="flat",
+            padx=10,
+            pady=10,
+        )
+        yscroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=yscroll.set)
+        text.pack(side="left", fill="both", expand=True)
+        yscroll.pack(side="right", fill="y")
+        text.tag_configure("h1", font=("Segoe UI Semibold", 15), spacing1=10, spacing3=4)
+        text.tag_configure("h2", font=("Segoe UI Semibold", 13), spacing1=8, spacing3=3)
+        text.tag_configure("h3", font=("Segoe UI Semibold", 11), spacing1=6, spacing3=2)
+        text.tag_configure("code", font=("Consolas", 10), background="#f1f5f9")
+        text.tag_configure("inline_code", font=("Consolas", 10), background="#f8fafc")
+        text.tag_configure("bullet", lmargin1=14, lmargin2=30)
+        readme = Path.cwd() / "README.md"
+        if not readme.exists():
+            text.insert("end", "README.md not found.\n")
+            text.configure(state="disabled")
+            return
+        lines = readme.read_text(encoding="utf-8").splitlines()
+        in_code_block = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                text.insert("end", "\n")
+                continue
+            if in_code_block:
+                text.insert("end", line + "\n", ("code",))
+                continue
+            heading = re.match(r"^(#{1,3})\s+(.*)$", line)
+            if heading:
+                level = len(heading.group(1))
+                content = heading.group(2).strip()
+                text.insert("end", content + "\n", (f"h{level}",))
+                continue
+            bullet = re.match(r"^\s*-\s+(.*)$", line)
+            if bullet:
+                text.insert("end", "- ", ("bullet",))
+                self._insert_markdown_inline(text, bullet.group(1), ("bullet",))
+                text.insert("end", "\n", ("bullet",))
+                continue
+            self._insert_markdown_inline(text, line)
+            text.insert("end", "\n")
+        text.configure(state="disabled")
+
+    @staticmethod
+    def _insert_markdown_inline(widget: tk.Text, line: str, tags: tuple[str, ...] = ()) -> None:
+        i = 0
+        for match in re.finditer(r"`([^`]+)`", line):
+            start, end = match.span()
+            if start > i:
+                widget.insert("end", line[i:start], tags)
+            widget.insert("end", match.group(1), (*tags, "inline_code"))
+            i = end
+        if i < len(line):
+            widget.insert("end", line[i:], tags)
 
     def _browse_env(self) -> None:
         p = filedialog.asksaveasfilename(title="Select .env", defaultextension=".env", initialfile=".env")
@@ -448,7 +650,34 @@ class DictateGui(tk.Tk):
         self.after(80, self._drain_log)
 
     def _append_log(self, line: str) -> None:
-        self._log.insert("end", line + "\n")
+        s = line.strip().lower()
+        info_tokens = (
+            "prompt disabled target=",
+            "using default cleanup prompt",
+        )
+        error_tokens = (
+            "error:",
+            "record start failed",
+            "portaudioerror",
+            "traceback",
+            "exception",
+            "http error status=",
+            " failed in 'src/hostapi/alsa",
+            "model refresh failed",
+            "input device refresh failed",
+        )
+        warn_tokens = (
+            "warning",
+            "restart required",
+        )
+        if any(tok in s for tok in info_tokens):
+            self._log.insert("end", line + "\n")
+        elif any(tok in s for tok in error_tokens):
+            self._log.insert("end", line + "\n", ("log_error",))
+        elif any(tok in s for tok in warn_tokens):
+            self._log.insert("end", line + "\n", ("log_warn",))
+        else:
+            self._log.insert("end", line + "\n")
         self._log.see("end")
 
     def _on_var_changed(self, key: str) -> None:
