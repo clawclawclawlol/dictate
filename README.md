@@ -65,7 +65,7 @@ dictate-min --list-input-devices
 - `DICTATE_DEBUG_KEYS`: `1` to log every key press/release and whether it matches PTT (default `0`)
 - `DICTATE_FILE_LOG`: `1` to append runtime/model/output events to `YYYYMMDD.log` (default `1`)
 - `DICTATE_RUNTIME_ENV_FILE`: optional path to a runtime `.env` overrides file polled while running for hot updates (default disabled)
-  - hot-reloadable: debug flags, most cleanup settings, `DICTATE_PTT_AUTO_PAUSE_MEDIA`, ducking settings, `DICTATE_PTT_AUTO_SUBMIT`, `DICTATE_CONTEXT_RESET_EVERY`, `DICTATE_TRIM_CHUNK_PERIOD`, `DICTATE_LOOP_GUARD`, `DICTATE_PASTE_ALIGN_FOCUS`
+  - hot-reloadable: debug flags, most cleanup settings, `DICTATE_PTT_AUTO_PAUSE_MEDIA`, ducking settings, `DICTATE_PTT_AUTO_SUBMIT`, `DICTATE_CONTEXT_RESET_EVERY`, `DICTATE_TRIM_CHUNK_PERIOD`, `DICTATE_LOOP_GUARD`, `DICTATE_LOOP_GUARD_ALLOW`, `DICTATE_PASTE_ALIGN_FOCUS`
   - restart-required: mode/device/STT engine settings, paste transport settings, and most audio pipeline geometry settings
 
 ### Push-to-talk mode
@@ -120,6 +120,8 @@ dictate-min --list-input-devices
 - `DICTATE_STT_LOGPROB_THRESHOLD`: log-prob threshold (default `-1.0`)
 - `DICTATE_STT_COMPRESSION_RATIO_THRESHOLD`: compression-ratio threshold (default `2.4`)
 - `DICTATE_INPUT_LANGUAGE`: `auto` or language code (default `auto`)
+- The current defaults and decoding parameters above are the settings that have worked best for this project so far.
+- `DICTATE_STT_CONDITION_PREV` is still a useful tuning knob to experiment with per setup/content: `0` usually reduces cross-chunk drift/repetition, while `1` can improve continuity.
 
 #### Context + overlap
 - `DICTATE_CONTEXT`: enable text context carryover (`1`/`0`, default `1`)
@@ -136,6 +138,9 @@ dictate-min --list-input-devices
 - `DICTATE_LOOP_GUARD_PUNCT_RATIO`: punctuation-density trigger ratio (default `0.35`)
 - `DICTATE_LOOP_GUARD_SHORT_RUN`: repeated short-token run trigger length (default `4`)
 - `DICTATE_LOOP_GUARD_SHORT_LEN`: max token length considered “short” for run detection (default `3`)
+- `DICTATE_LOOP_GUARD_ALLOW`: comma-separated exact-match allowlist that bypasses loop guard (spaces/`;` also accepted) (default `ipv4,mac,semver,dotted_numeric`)
+  - supported rules: `ipv4`, `ipv6`, `mac`, `semver`, `dotted_numeric`
+  - examples: `1.1.1.1` (`ipv4`), `AA:BB:CC:DD:EE:FF` (`mac`), `1.2.3` (`semver`/`dotted_numeric`)
 
 ## Notes
 

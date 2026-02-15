@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
+import shlex
+import shutil
 import subprocess
 import threading
 from dataclasses import dataclass
@@ -83,6 +86,7 @@ FIELD_SPECS: list[FieldSpec] = [
     FieldSpec("DICTATE_LOOP_GUARD_PUNCT_RATIO", "Loop Punct Ratio", "float", "0.35", "Context"),
     FieldSpec("DICTATE_LOOP_GUARD_SHORT_RUN", "Loop Short Run", "int", "4", "Context"),
     FieldSpec("DICTATE_LOOP_GUARD_SHORT_LEN", "Loop Short Len", "int", "3", "Context"),
+    FieldSpec("DICTATE_LOOP_GUARD_ALLOW", "Loop Guard Allow", "str", "ipv4,mac,semver,dotted_numeric", "Context"),
 
     FieldSpec("DICTATE_CLEANUP", "Cleanup Enabled", "bool", "1", "Cleanup"),
     FieldSpec("DICTATE_CLEANUP_BACKEND", "Cleanup Backend", "enum", "ollama", "Cleanup", ("ollama", "generic_v1", "api_v1", "lm_api_v1")),
@@ -132,7 +136,7 @@ RESTART_REQUIRED_ENV: set[str] = {
     "DICTATE_PASTE_RESTORE_DELAY_MS",
 }
 
-PRESETS: dict[str, dict[str, str]] = {
+BUILTIN_PRESETS: dict[str, dict[str, str]] = {
     "Default": {},
     "Terminal Dictation": {
         "DICTATE_MODE": "ptt",
@@ -152,6 +156,7 @@ PRESETS: dict[str, dict[str, str]] = {
         "DICTATE_CONTEXT_RESET_EVERY": "1",
     },
 }
+PRESETS: dict[str, dict[str, str]] = {name: dict(values) for name, values in BUILTIN_PRESETS.items()}
 
 ENV_TOOLTIPS: dict[str, str] = {
     "DICTATE_MODE": "Run mode: `ptt` records on push-to-talk key, `loopback` continuously captures output loopback audio.",
@@ -198,6 +203,7 @@ ENV_TOOLTIPS: dict[str, str] = {
     "DICTATE_LOOP_GUARD_PUNCT_RATIO": "Loop guard punctuation-density trigger ratio.",
     "DICTATE_LOOP_GUARD_SHORT_RUN": "Loop guard repeated short-token run trigger length.",
     "DICTATE_LOOP_GUARD_SHORT_LEN": "Maximum token length counted as `short` in loop-run detection.",
+    "DICTATE_LOOP_GUARD_ALLOW": "Comma-separated (recommended; space/semicolon also accepted) allowlist that bypasses loop guard for exact matches. Supported: ipv4, ipv6, mac, semver, dotted_numeric.",
     "DICTATE_CLEANUP": "Enable cleanup pass over raw transcription output.",
     "DICTATE_CLEANUP_BACKEND": "Cleanup backend: `ollama` or OpenAI-compatible `generic_v1` aliases.",
     "DICTATE_CLEANUP_URL": "Cleanup chat endpoint URL.",
@@ -312,8 +318,10 @@ class DictateGui(tk.Tk):
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._vars: dict[str, tk.Variable] = {}
         self._widgets: dict[str, tk.Widget] = {}
+        self._preset_box: ttk.Combobox | None = None
         self._spec_by_name = {s.name: s for s in FIELD_SPECS}
         self._env_path = tk.StringVar(value=str(Path.cwd() / ".env"))
+        self._presets_path = Path.cwd() / ".dictate-presets.json"
         self._runtime_overrides_path = Path.cwd() / ".dictate-runtime.env"
         self._preset = tk.StringVar(value="Default")
         self._auto_restart = tk.BooleanVar(value=True)
@@ -323,6 +331,7 @@ class DictateGui(tk.Tk):
         self._input_devices: list[tuple[str, str]] = []
         self._tooltips: list[Tooltip] = []
 
+        self._load_saved_presets()
         self._setup_style()
         self._build_ui()
         self._reset_to_defaults()
@@ -359,26 +368,29 @@ class DictateGui(tk.Tk):
 
         controls = ttk.Frame(root)
         controls.pack(fill="x", pady=(0, 10))
-        ttk.Label(controls, text="Env File").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(controls, textvariable=self._env_path, width=70).grid(row=0, column=1, sticky="ew")
-        ttk.Button(controls, text="Browse", command=self._browse_env).grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(controls, text="Load", command=self._load_env).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(controls, text="Save", command=self._save_env).grid(row=0, column=4, padx=(8, 0))
+        ttk.Label(controls, text="Preset").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        preset_box = ttk.Combobox(controls, textvariable=self._preset, values=list(PRESETS), state="normal", width=28)
+        preset_box.grid(row=0, column=1, sticky="w")
+        self._preset_box = preset_box
+        ttk.Button(controls, text="Apply Preset", command=self._apply_preset).grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(controls, text="Save Preset", command=self._save_preset).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(controls, text="Reset Defaults", command=self._reset_to_defaults).grid(row=0, column=4, padx=(8, 0))
 
-        ttk.Label(controls, text="Preset").grid(row=1, column=0, sticky="w", pady=(8, 0), padx=(0, 8))
-        preset_box = ttk.Combobox(controls, textvariable=self._preset, values=list(PRESETS), state="readonly", width=28)
-        preset_box.grid(row=1, column=1, sticky="w", pady=(8, 0))
-        ttk.Button(controls, text="Apply Preset", command=self._apply_preset).grid(row=1, column=2, pady=(8, 0), padx=(8, 0))
-        ttk.Button(controls, text="Reset Defaults", command=self._reset_to_defaults).grid(row=1, column=3, pady=(8, 0), padx=(8, 0))
+        ttk.Label(controls, text="Env File").grid(row=0, column=5, sticky="w", padx=(16, 8))
+        ttk.Entry(controls, textvariable=self._env_path, width=70).grid(row=0, column=6, sticky="ew")
+        ttk.Button(controls, text="Browse", command=self._browse_env).grid(row=0, column=7, padx=(8, 0))
+        ttk.Button(controls, text="Load", command=self._load_env).grid(row=0, column=8, padx=(8, 0))
+        ttk.Button(controls, text="Save", command=self._save_env).grid(row=0, column=9, padx=(8, 0))
 
-        ttk.Button(controls, text="Start dictate-min", style="Accent.TButton", command=self._start).grid(row=1, column=4, pady=(8, 0), padx=(8, 0))
-        ttk.Button(controls, text="Apply Live", command=self._apply_live).grid(row=1, column=5, pady=(8, 0), padx=(8, 0))
-        ttk.Button(controls, text="Stop", command=self._stop).grid(row=1, column=6, pady=(8, 0), padx=(8, 0))
-        ttk.Button(controls, text="Refresh Models", command=self._refresh_model_choices).grid(row=1, column=7, pady=(8, 0), padx=(8, 0))
-        ttk.Checkbutton(controls, text="Auto Restart", variable=self._auto_restart).grid(row=1, column=8, pady=(8, 0), padx=(12, 0), sticky="w")
-        ttk.Button(controls, text="Refresh Input Devices", command=self._refresh_input_devices).grid(row=1, column=9, pady=(8, 0), padx=(8, 0))
+        ttk.Button(controls, text="Start dictate-min", style="Accent.TButton", command=self._start).grid(row=1, column=0, pady=(8, 0), padx=(0, 8))
+        ttk.Button(controls, text="Apply Live", command=self._apply_live).grid(row=1, column=1, pady=(8, 0), padx=(0, 8))
+        ttk.Button(controls, text="Stop", command=self._stop).grid(row=1, column=2, pady=(8, 0), padx=(0, 8))
+        ttk.Button(controls, text="Refresh Models", command=self._refresh_model_choices).grid(row=1, column=3, pady=(8, 0), padx=(0, 8))
+        ttk.Checkbutton(controls, text="Auto Restart", variable=self._auto_restart).grid(row=1, column=4, pady=(8, 0), padx=(4, 8), sticky="w")
+        ttk.Button(controls, text="Refresh Input Devices", command=self._refresh_input_devices).grid(row=1, column=5, pady=(8, 0), padx=(0, 8))
+        ttk.Button(controls, text="Copy Start Command", command=self._copy_start_command).grid(row=1, column=6, pady=(8, 0), padx=(0, 8))
 
-        controls.columnconfigure(1, weight=1)
+        controls.columnconfigure(6, weight=1)
 
         body = ttk.Panedwindow(root, orient="vertical")
         body.pack(fill="both", expand=True)
@@ -529,6 +541,29 @@ class DictateGui(tk.Tk):
         self._suspend_auto_apply = False
         self._schedule_auto_apply(set(preset.keys()))
 
+    def _save_preset(self) -> None:
+        name = self._preset.get().strip()
+        if not name:
+            messagebox.showwarning("Preset", "Enter a preset name first.")
+            return
+        if name == "Default":
+            messagebox.showwarning("Preset", "The 'Default' preset name is reserved.")
+            return
+        if name in PRESETS and not messagebox.askyesno("Preset", f"Overwrite preset '{name}'?"):
+            return
+        preset_values: dict[str, str] = {}
+        for spec in FIELD_SPECS:
+            current = self._var_as_string(spec.name)
+            current_norm = self._normalize_for_compare(spec, current)
+            default_norm = self._normalize_for_compare(spec, spec.default)
+            if current_norm != default_norm:
+                preset_values[spec.name] = current
+        PRESETS[name] = preset_values
+        self._refresh_preset_choices()
+        if not self._write_saved_presets():
+            return
+        self._append_log(f"Saved preset '{name}' with {len(preset_values)} override(s)")
+
     def _reset_to_defaults(self) -> None:
         was_suspended = self._suspend_auto_apply
         self._suspend_auto_apply = True
@@ -570,12 +605,115 @@ class DictateGui(tk.Tk):
         else:
             var.set(str(value))
 
+    def _refresh_preset_choices(self) -> None:
+        if self._preset_box is not None:
+            self._preset_box["values"] = list(PRESETS)
+
+    def _load_saved_presets(self) -> None:
+        if not self._presets_path.exists():
+            return
+        try:
+            data = json.loads(self._presets_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        for raw_name, raw_values in data.items():
+            name = str(raw_name).strip()
+            if not name or name == "Default":
+                continue
+            if not isinstance(raw_values, dict):
+                continue
+            clean: dict[str, str] = {}
+            for key, value in raw_values.items():
+                if key in self._spec_by_name:
+                    clean[key] = str(value)
+            PRESETS[name] = clean
+
+    def _write_saved_presets(self) -> bool:
+        to_save: dict[str, dict[str, str]] = {}
+        for name, values in PRESETS.items():
+            if name == "Default":
+                continue
+            if name in BUILTIN_PRESETS and values == BUILTIN_PRESETS[name]:
+                continue
+            to_save[name] = dict(values)
+        try:
+            self._presets_path.write_text(
+                json.dumps(to_save, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        except Exception as e:
+            messagebox.showerror("Preset", f"Failed to write presets: {e!r}")
+            return False
+        return True
+
     def _var_as_string(self, name: str) -> str:
         spec = self._spec_by_name[name]
         var = self._vars[name]
         if spec.kind == "bool":
             return "1" if bool(var.get()) else "0"
         return str(var.get()).strip()
+
+    @staticmethod
+    def _normalize_for_compare(spec: FieldSpec, value: str) -> str:
+        s = value.strip()
+        if spec.kind == "bool":
+            return "1" if s.lower() in {"1", "true", "yes", "on"} else "0"
+        if spec.kind == "int":
+            try:
+                return str(int(s))
+            except Exception:
+                return s
+        if spec.kind == "float":
+            try:
+                return format(float(s), ".12g")
+            except Exception:
+                return s
+        return s
+
+    def _build_start_command(self) -> str:
+        env_parts: list[str] = []
+        for spec in FIELD_SPECS:
+            current = self._var_as_string(spec.name)
+            current_norm = self._normalize_for_compare(spec, current)
+            default_norm = self._normalize_for_compare(spec, spec.default)
+            if current_norm != default_norm:
+                env_parts.append(f"{spec.name}={shlex.quote(current)}")
+        return (" ".join(env_parts) + " " if env_parts else "") + "dictate-min"
+
+    def _copy_start_command(self) -> None:
+        cmd = self._build_start_command()
+        copied = False
+        if shutil.which("wl-copy"):
+            try:
+                subprocess.run(["wl-copy"], input=cmd, text=True, check=True)
+                copied = True
+            except Exception:
+                copied = False
+        if not copied and shutil.which("xclip"):
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=cmd, text=True, check=True)
+                copied = True
+            except Exception:
+                copied = False
+        if not copied and shutil.which("xsel"):
+            try:
+                subprocess.run(["xsel", "--clipboard", "--input"], input=cmd, text=True, check=True)
+                copied = True
+            except Exception:
+                copied = False
+        if not copied and shutil.which("pbcopy"):
+            try:
+                subprocess.run(["pbcopy"], input=cmd, text=True, check=True)
+                copied = True
+            except Exception:
+                copied = False
+        if not copied:
+            self.clipboard_clear()
+            self.clipboard_append(cmd)
+            self.update_idletasks()
+        self._append_log(f"Copied start command: {cmd}")
 
     def _start(self) -> None:
         if self._proc and self._proc.poll() is None:

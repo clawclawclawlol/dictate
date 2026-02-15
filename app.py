@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from collections import deque
+import ipaddress
 import os
 import platform
 import queue
@@ -227,6 +228,7 @@ class Config:
     loop_guard_max_punct_ratio: float = env_float("DICTATE_LOOP_GUARD_PUNCT_RATIO", 0.35)
     loop_guard_short_run: int = env_int("DICTATE_LOOP_GUARD_SHORT_RUN", 4)
     loop_guard_short_len: int = env_int("DICTATE_LOOP_GUARD_SHORT_LEN", 3)
+    loop_guard_allow: str = os.environ.get("DICTATE_LOOP_GUARD_ALLOW", "ipv4,mac,semver,dotted_numeric")
     file_log_enabled: bool = env_bool("DICTATE_FILE_LOG", True)
     ptt_key: str = os.environ.get("DICTATE_PTT_KEY", "ctrl_r")
 
@@ -1545,6 +1547,8 @@ def main() -> int:
             )
         if "DICTATE_LOOP_GUARD" in overrides:
             set_if_changed("loop_guard_enabled", _parse_bool_value(overrides["DICTATE_LOOP_GUARD"], cfg.loop_guard_enabled))
+        if "DICTATE_LOOP_GUARD_ALLOW" in overrides:
+            set_if_changed("loop_guard_allow", overrides["DICTATE_LOOP_GUARD_ALLOW"].strip())
 
         # Cleanup runtime settings.
         cleanup_changed = False
@@ -1688,7 +1692,8 @@ def main() -> int:
         f"repeat_ratio={cfg.loop_guard_max_repeat_ratio} "
         f"punct_ratio={cfg.loop_guard_max_punct_ratio} "
         f"short_run={cfg.loop_guard_short_run} "
-        f"short_len={cfg.loop_guard_short_len}"
+        f"short_len={cfg.loop_guard_short_len} "
+        f"allow={cfg.loop_guard_allow!r}"
     )
     dlog(
         "transcription destination: stdout"
@@ -1760,6 +1765,7 @@ def main() -> int:
                 cfg.loop_guard_max_punct_ratio,
                 cfg.loop_guard_short_run,
                 cfg.loop_guard_short_len,
+                cfg.loop_guard_allow,
             ):
                 bad_streak += 1
                 dlog(f"chunk#{chunk_no}: pathological repetition detected (streak={bad_streak}), dropped")
@@ -1779,7 +1785,10 @@ def main() -> int:
             dlog(f"chunk#{chunk_no}: cleanup_ms={(time.time()-t1)*1000:.0f}")
             flog("MODEL_RESULT", f"n={chunk_no} model=cleanup ms={(time.time()-t1)*1000:.0f} text={final!r}")
             if final:
-                pipeline.output(final, target_window_id=target_window_id)
+                output_text = final
+                if cfg.mode == "ptt" and cfg.paste:
+                    output_text = final.strip()
+                pipeline.output(output_text, target_window_id=target_window_id)
                 if submit_after:
                     pipeline.submit()
                 clear_ptt_indicator()
@@ -1795,8 +1804,14 @@ def main() -> int:
                     pipeline.reset_context()
                     ok_since_reset = 0
             else:
-                dlog(f"chunk#{chunk_no}: empty after cleanup")
-                flog("CHUNK_SKIP", f"n={chunk_no} reason=empty_after_cleanup")
+                if cfg.mode == "loopback":
+                    # Preserve live loopback stdout output when cleanup collapses text.
+                    sys.stdout.write(text + " ")
+                    sys.stdout.flush()
+                    flog("OUTPUT", f"n={chunk_no} text={text!r} fallback=raw_stt")
+                else:
+                    dlog(f"chunk#{chunk_no}: empty after cleanup")
+                    flog("CHUNK_SKIP", f"n={chunk_no} reason=empty_after_cleanup")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
@@ -1962,9 +1977,12 @@ def _is_pathological_loop_text(
     max_punct_ratio: float,
     short_run: int,
     short_len: int,
+    allow_spec: str,
 ) -> bool:
     s = text.strip()
     if not s:
+        return False
+    if _loop_guard_allow_match(s, allow_spec):
         return False
     words = s.split()
     if len(words) >= 8:
@@ -1992,6 +2010,35 @@ def _is_pathological_loop_text(
                 return True
         else:
             run = 1
+    return False
+
+
+def _loop_guard_allow_match(text: str, allow_spec: str) -> bool:
+    rules = [r.strip().lower() for r in re.split(r"[,\s;]+", allow_spec or "") if r.strip()]
+    if not rules:
+        return False
+    for rule in rules:
+        if rule == "ipv4":
+            try:
+                if isinstance(ipaddress.ip_address(text), ipaddress.IPv4Address):
+                    return True
+            except ValueError:
+                pass
+        elif rule == "ipv6":
+            try:
+                if isinstance(ipaddress.ip_address(text), ipaddress.IPv6Address):
+                    return True
+            except ValueError:
+                pass
+        elif rule == "mac":
+            if re.fullmatch(r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}", text):
+                return True
+        elif rule == "semver":
+            if re.fullmatch(r"v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", text):
+                return True
+        elif rule == "dotted_numeric":
+            if re.fullmatch(r"\d+(?:\.\d+){2,}", text):
+                return True
     return False
 
 
